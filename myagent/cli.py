@@ -4,6 +4,7 @@ import sys
 
 import readline
 
+from .argparse import parse_args
 from .params import DEFAULT_PARAMS
 from .provider import complete
 
@@ -23,8 +24,10 @@ BANNER = r"""
 def main() -> int:
     print(BANNER)
 
+    args = parse_args()
+
     # 仅 --one_shot 模式：调用一次 LLM，提示词由用户直接输入（不依赖 --prompt）。
-    if "--one_shot" not in sys.argv:
+    if not args.one_shot:
         print("用法：python -m myagent --one_shot", file=sys.stderr)
         return 0
 
