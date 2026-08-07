@@ -5,9 +5,13 @@ import sys
 
 import readline
 
+from pathlib import Path
 from .argparse import parse_args
-from .params import DEFAULT_PARAMS
+from .api_config import MODELS_PARAMS
 from .provider import complete
+from .agent_config import AgentParams, expand_syms
+from .agent_loop import AgentLoop
+
 
 
 BANNER = r"""
@@ -19,6 +23,10 @@ BANNER = r"""
  ╚═╝     ╚═╝   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝   
 
                  AI Agent Terminal
+
+转义命令：
+    /exit   退出
+    /quit   退出
 """
 
 
@@ -26,6 +34,9 @@ def main() -> int:
     print(BANNER)
 
     args = parse_args()
+    agent_params = AgentParams(
+        cwd=args.cwd,
+    )
 
     # 工作目录设定：--cwd 指定后先切换过去。
     try:
@@ -36,11 +47,12 @@ def main() -> int:
 
     # 两种模式：--one_shot 调用一次；否则进入交互式多轮。
     if args.one_shot:
-        return _one_shot()
-    return _repl()
+        return _one_shot(agent_params)
+    else:
+        agent_loop = AgentLoop(agent_params)
 
 
-def _one_shot() -> int:
+def _one_shot(agent_params: AgentParams) -> int:
     """one_shot 模式：只调用一次 LLM，提示词由用户直接输入。"""
     try:
         prompt = input("你：").strip()
@@ -51,36 +63,20 @@ def _one_shot() -> int:
         print("没有输入内容，已退出。", file=sys.stderr)
         return 1
 
+    # 通过修改 agent_params 加载 one_shot 系统提示词文件内容：
+    # "#sym:one_shot_system_prompt" 会展开为 prompts/one_shot_system_prompt.md。
+    agent_params.system_prompt = "#sym:one_shot_system_prompt"
+    system_prompt = expand_syms(agent_params.system_prompt).strip()
+    if system_prompt:
+        prompt = f"{prompt}\n\n{system_prompt}"
+
     try:
-        result = complete(prompt, max_new_tokens=DEFAULT_PARAMS.max_tokens)
+        result = complete(max_new_tokens=MODELS_PARAMS.max_tokens, prompt=prompt)
     except RuntimeError as exc:
         print(f"连接失败：{exc}", file=sys.stderr)
         return 1
 
     print(f"{result.settings.name}（{result.settings.model}）：{result.answer}")
     return 0
-
-
-def _repl() -> int:
-    """非 one_shot 模式：交互式多轮对话，输入 /exit、exit 或 quit 退出。"""
-    print("输入 /exit 退出。")
-    while True:
-        try:
-            prompt = input("你：").strip()
-        except EOFError:
-            print()
-            return 0
-        if not prompt:
-            continue
-        if prompt in ("/exit", "/quit", "exit", "quit"):
-            return 0
-
-        try:
-            result = complete(prompt, max_new_tokens=DEFAULT_PARAMS.max_tokens)
-        except RuntimeError as exc:
-            print(f"连接失败：{exc}", file=sys.stderr)
-            continue
-
-        print(f"{result.settings.name}（{result.settings.model}）：{result.answer}")
 
 
