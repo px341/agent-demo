@@ -9,7 +9,7 @@ from pathlib import Path
 from .argparse import parse_args
 from .api_config import MODELS_PARAMS
 from .provider import complete
-from .agent_config import AgentParams, expand_syms
+from .agent_config import AgentParams
 from .agent_loop import AgentLoop
 
 
@@ -64,9 +64,9 @@ def _one_shot(agent_params: AgentParams) -> int:
         return 1
 
     # 通过修改 agent_params 加载 one_shot 系统提示词文件内容：
-    # "#sym:one_shot_system_prompt" 会展开为 prompts/one_shot_system_prompt.md。
-    agent_params.system_prompt = "#sym:one_shot_system_prompt"
-    system_prompt = expand_syms(agent_params.system_prompt).strip()
+    # 赋值为文件名，setter 会自动读取 prompts/one_shot_system_prompt.md。
+    agent_params.system_prompt = "one_shot_system_prompt"
+    system_prompt = (agent_params.system_prompt or "").strip()
     if system_prompt:
         prompt = f"{prompt}\n\n{system_prompt}"
 
