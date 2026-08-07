@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Literal
 
 BASE_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -37,7 +38,7 @@ class AgentParams:
     tools: list[str] = None
 
     # 消息历史记录：用于存放消息历史记录的列表，默认为 None。
-    messages: list[str] = None
+    messages: list[Message] = None
 
     # 是否可以使用工具：用于指示是否可以使用工具，默认为 False。
     can_use_tools: bool = False
@@ -61,3 +62,33 @@ class AgentParams:
         self._system_prompt = load_prompt(value)
 
 
+Role = Literal[
+    "system",
+    "user",
+    "assistant",
+    "tool",
+]
+
+
+@dataclass(slots=True)
+class Message:
+    """
+    Agent内部统一消息格式。
+    """
+
+    role: Role
+
+    content: str | None = None
+
+    # 工具调用信息
+    tool_calls: list[dict[str, Any]] = field(
+        default_factory=list
+    )
+
+    # 工具返回结果
+    tool_call_id: str | None = None
+
+    # 扩展字段
+    metadata: dict[str, Any] = field(
+        default_factory=dict
+    )

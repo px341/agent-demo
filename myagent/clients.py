@@ -62,6 +62,15 @@ class ModelClient:
     def complete(self, prompt: str, max_new_tokens: int = 512) -> str:
         raise NotImplementedError
 
+    def chat(
+        self,
+        messages: list[dict[str, str]],
+        system: str | None = None,
+        max_new_tokens: int = 512,
+    ) -> str:
+        """多轮消息数组调用：role/content 真正分离，system 单独携带。"""
+        raise NotImplementedError
+
     def _require_api_key(self) -> str:
         if not self.settings.api_key:
             raise RuntimeError(f"{self.settings.name} API key is not configured")
@@ -87,6 +96,27 @@ class OllamaModelClient(ModelClient):
             raise RuntimeError(f"Ollama error: {data['error']}")
         return str(data.get("response", ""))
 
+    def chat(self, messages, system=None, max_new_tokens=512) -> str:
+        payload_messages = list(messages)
+        if system:
+            payload_messages = [{"role": "system", "content": system}, *payload_messages]
+        data = _post_json(
+            self.settings.base_url.rstrip("/") + "/api/chat",
+            {
+                "model": self.model,
+                "messages": payload_messages,
+                "stream": False,
+                "options": {
+                    "num_predict": max_new_tokens,
+                },
+            },
+            {},
+            self.settings.timeout,
+        )
+        if data.get("error"):
+            raise RuntimeError(f"Ollama error: {data['error']}")
+        return str(data.get("message", {}).get("content", ""))
+
 
 class OpenAICompatibleModelClient(ModelClient):
     def complete(self, prompt: str, max_new_tokens: int = 512) -> str:
@@ -95,6 +125,34 @@ class OpenAICompatibleModelClient(ModelClient):
             "input": prompt,
             "max_output_tokens": max_new_tokens,
         }
+
+        data = _post_json(
+            _versioned_url(self.settings.base_url, "/responses"),
+            payload,
+            {"Authorization": f"Bearer {self._require_api_key()}"},
+            self.settings.timeout,
+        )
+        if data.get("error"):
+            raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
+        if data.get("output_text"):
+            return str(data["output_text"])
+        for output in data.get("output", []):
+            for content in output.get("content", []):
+                if content.get("text"):
+                    return str(content["text"])
+        raise RuntimeError("OpenAI-compatible response contains no text")
+
+    def chat(self, messages, system=None, max_new_tokens=512) -> str:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_output_tokens": max_new_tokens,
+            "input": [
+                {"role": message["role"], "content": message["content"]}
+                for message in messages
+            ],
+        }
+        if system:
+            payload["instructions"] = system
 
         data = _post_json(
             _versioned_url(self.settings.base_url, "/responses"),
@@ -122,6 +180,34 @@ class AnthropicCompatibleModelClient(ModelClient):
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_new_tokens,
             },
+            {
+                "x-api-key": self._require_api_key(),
+                "anthropic-version": "2023-06-01",
+            },
+            self.settings.timeout,
+        )
+        if data.get("error"):
+            raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
+        for content in data.get("content", []):
+            if content.get("type") == "text":
+                return str(content.get("text", ""))
+        raise RuntimeError("Anthropic-compatible response contains no text")
+
+    def chat(self, messages, system=None, max_new_tokens=512) -> str:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_new_tokens,
+            "messages": [
+                {"role": message["role"], "content": message["content"]}
+                for message in messages
+            ],
+        }
+        if system:
+            payload["system"] = system
+
+        data = _post_json(
+            _versioned_url(self.settings.base_url, "/messages"),
+            payload,
             {
                 "x-api-key": self._require_api_key(),
                 "anthropic-version": "2023-06-01",

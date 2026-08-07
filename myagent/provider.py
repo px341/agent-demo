@@ -9,6 +9,9 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .agent_config import AgentParams, Message
+from .actions import FinalAnswer, Retry, ToolCall, parse_action
+
 
 # 优先读取本地的 .env.llm（真实配置/密钥），缺失时回退到 .env.example 模板。
 ENV_FILES = (
@@ -37,7 +40,6 @@ class ChatResult:
 
     answer: str
     settings: ProviderSettings
-
 
 def _env_file() -> Path:
     """按优先级找到可用的配置文件。"""
@@ -140,6 +142,58 @@ def chat(prompt: str, provider: str | None = None) -> str:
     """轻量便捷函数：只返回回答文本（不关心展示信息时使用）。"""
 
     return complete(prompt, provider=provider).answer
+
+
+def _message_payload(params: AgentParams, user_input: str) -> list[dict[str, str]]:
+    """把 AgentParams.messages + 本轮输入转成 role/content 消息数组。"""
+    payload: list[dict[str, str]] = []
+    for message in params.messages or []:
+        payload.append({"role": message.role, "content": message.content or ""})
+    if user_input:
+        payload.append({"role": "user", "content": user_input})
+    return payload
+
+
+def agent_turn(
+    params: AgentParams,
+    user_input: str,
+    provider: str | None = None,
+    max_new_tokens: int = 512,
+) -> Message:
+    """多轮对话的一次调用，与单次的 complete() 完全独立。
+
+    职责链：加载配置 → 创建客户端 → 校验 API Key → 发送 messages 数组 → 解析输出。
+    模型输出按 JSON 契约（{"action": "tool_call"|"final"}）解析为
+    ToolCall / FinalAnswer / Retry，并包装成 assistant 的 Message 返回；
+    调用方据此决定执行工具还是收口。
+    """
+    client = create_client(provider)
+    if not client.settings.api_key:
+        raise RuntimeError(
+            f"未配置 {client.settings.api_key_env}，请在 .env.llm 中设置。"
+        )
+    answer = client.chat(
+        _message_payload(params, user_input),
+        system=params.system_prompt,
+        max_new_tokens=max_new_tokens,
+    )
+
+    action = parse_action(answer)
+    message = Message(role="assistant", content=answer)
+
+    if isinstance(action, ToolCall):
+        message.tool_calls = [
+            {"name": action.name, "arguments": action.args, "raw": action.raw}
+        ]
+        message.metadata["action"] = "tool_call"
+    elif isinstance(action, Retry):
+        message.metadata["action"] = "retry"
+        message.metadata["reason"] = action.reason
+    else:  # FinalAnswer
+        message.content = action.text
+        message.metadata["action"] = "final"
+
+    return message
 
 
 def list_providers() -> list[str]:
