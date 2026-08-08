@@ -9,7 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-BASE_DIR = Path(__file__).resolve().parent / "prompts"
+BASE_DIR = Path(__file__).resolve().parent.parent
+STORAGE_DIR = BASE_DIR / ".storage"
+PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
 
 def load_prompt(name: str | None) -> str | None:
@@ -21,7 +23,7 @@ def load_prompt(name: str | None) -> str | None:
         return name
     path = Path(name)
     if not path.is_absolute():
-        path = BASE_DIR / path
+        path = PROMPT_DIR / path
     if path.suffix == "":
         path = path.with_suffix(".md")
     return path.read_text(encoding="utf-8")
@@ -46,8 +48,13 @@ class AgentParams:
     # token 限制：用于限制消息的最大长度，默认为 128000。
     token_limit: int = 128000
 
+    token_out_limit: int = 16392
+
     # 最大轮数：用于限制消息的最大轮数，默认为 10。
     max_turns: int = 10
+
+    # 对话历史存储目录：本地永久化保存对话的文件夹路径，默认为 STORAGE_DIR。
+    storage_dir: str = STORAGE_DIR
 
     # system_prompt 的存储字段（不作为 __init__ 参数）。
     _system_prompt: str = field(default=None, init=False, repr=False)

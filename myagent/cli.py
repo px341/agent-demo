@@ -50,6 +50,7 @@ def main() -> int:
         return _one_shot(agent_params)
     else:
         agent_loop = AgentLoop(agent_params)
+        agent_loop.run()
 
 
 def _one_shot(agent_params: AgentParams) -> int:
