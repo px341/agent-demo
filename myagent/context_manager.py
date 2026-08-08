@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .agent_config import AgentParams, Message
-from tokenizer import tokenizer
+import tiktoken
 from dataclasses import dataclass, field, asdict
 import json
 from datetime import datetime
@@ -20,7 +20,7 @@ class ContextManager:
     def __init__(self, agent_params: AgentParams):
         self.agent_params = agent_params
         self.messages: list[Message] = agent_params.messages or []
-        self.tokenizer = tokenizer
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
         self.storage_dir = (
             Path(agent_params.storage_dir).resolve()
             if agent_params.storage_dir
@@ -94,14 +94,22 @@ class ContextManager:
             encoding="utf-8",
         )
 
-    def add_user_message(self, content: str) -> None:
-        """添加用户消息，裁剪以满足 token 限制，然后增量保存。"""
-        message = Message(role="user", content=content)
+    def _sync_params(self) -> None:
+        """把当前消息列表同步回 agent_params.messages，保证调用方读取一致。"""
+        self.agent_params.messages = self.messages
+
+    def add_message(self, message: Message) -> None:
+        """添加任意一条消息（user / assistant / tool），裁剪、增量保存并同步到参数。"""
         self.messages.append(message)
         self._session_messages.append(message)
         # 先裁剪，再保存仍留在上下文中的本会话消息。
         self.messages = self._clip(self.messages)
         self.save()
+        self._sync_params()
+
+    def add_user_message(self, content: str) -> None:
+        """添加用户消息，裁剪以满足 token 限制，然后增量保存。"""
+        self.add_message(Message(role="user", content=content))
 
     def __enter__(self):
         """进入上下文时，返回当前消息列表。"""
