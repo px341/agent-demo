@@ -85,6 +85,8 @@ def parse_action(text: str) -> Action:
     obj = _extract_json_object(text)
     if obj is None:
         return Retry(f"输出不是合法 JSON：{text[:80]!r}")
+    if not isinstance(obj, dict):
+        return Retry(f"输出必须是 JSON 对象：{obj!r}")
 
     action = obj.get("action")
     if action == "tool_call":

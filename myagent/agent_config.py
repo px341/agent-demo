@@ -14,21 +14,6 @@ STORAGE_DIR = BASE_DIR / ".storage"
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
 
-def load_prompt(name: str | None) -> str | None:
-    """按名称读取提示词文件；相对路径基于 prompts/ 目录，自动补全 .md 后缀。
-
-    传入 None 或空字符串时原样返回，便于直接赋给 system_prompt。
-    """
-    if not name:
-        return name
-    path = Path(name)
-    if not path.is_absolute():
-        path = PROMPT_DIR / path
-    if path.suffix == "":
-        path = path.with_suffix(".md")
-    return path.read_text(encoding="utf-8")
-
-
 @dataclass(frozen=False, slots=True)
 class AgentParams:
     """agent 的参数。"""
@@ -46,27 +31,18 @@ class AgentParams:
     can_use_tools: bool = False
 
     # token 限制：用于限制消息的最大长度，默认为 128000。
-    token_limit: int = 128000
+    max_input_tokens: int = 128000
 
-    token_out_limit: int = 16392
+    max_output_tokens: int = 16392
 
-    # 最大轮数：用于限制消息的最大轮数，默认为 10。
-    max_turns: int = 10
+    # 最大轮数：用于限制消息的最大轮数，默认为 15。
+    max_turns: int = 15
 
     # 对话历史存储目录：本地永久化保存对话的文件夹路径，默认为 STORAGE_DIR。
     storage_dir: str = STORAGE_DIR
 
-    # system_prompt 的存储字段（不作为 __init__ 参数）。
-    _system_prompt: str = field(default=None, init=False, repr=False)
-
-    @property
-    def system_prompt(self) -> str | None:
-        """系统提示词：赋文件名时自动读取 prompts/ 下对应文件内容。"""
-        return self._system_prompt
-
-    @system_prompt.setter
-    def system_prompt(self, value: str | None) -> None:
-        self._system_prompt = load_prompt(value)
+    # system_prompt 的路径
+    prompt_dir: str = PROMPT_DIR
 
 
 Role = Literal[

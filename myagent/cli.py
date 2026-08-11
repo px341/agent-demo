@@ -6,11 +6,13 @@ import sys
 import readline
 
 from pathlib import Path
+
+
+from .agent_config import AgentParams, Message
+from .agent_loop import AgentLoop, step_to_messages
 from .argparse import parse_args
-from .api_config import MODELS_PARAMS
-from .provider import complete
-from .agent_config import AgentParams
-from .agent_loop import AgentLoop
+from .contracts import AgentRequest, AgentResponse, StopReason
+from .provider import OpenAICompatibleModelClient
 
 
 
@@ -45,16 +47,18 @@ def main() -> int:
         print(f"无法进入工作目录 {args.cwd!r}：{exc}", file=sys.stderr)
         return 1
 
+    # 装配主循环：LLM 用 OpenAI SDK 客户端；工具/记忆后续按 Protocol 注入。
+    client = OpenAICompatibleModelClient(agent_params)
+    loop = AgentLoop(agent_params, llm=client)
+
     # 两种模式：--one_shot 调用一次；否则进入交互式多轮。
     if args.one_shot:
-        return _one_shot(agent_params)
-    else:
-        agent_loop = AgentLoop(agent_params)
-        agent_loop.run()
+        return _one_shot(loop)
+    return _repl(loop)
 
 
-def _one_shot(agent_params: AgentParams) -> int:
-    """one_shot 模式：只调用一次 LLM，提示词由用户直接输入。"""
+def _one_shot(loop: AgentLoop) -> int:
+    """one_shot 模式：只跑一次 ReAct 任务，提示词由用户直接输入。"""
     try:
         prompt = input("你：").strip()
     except EOFError:
@@ -64,20 +68,48 @@ def _one_shot(agent_params: AgentParams) -> int:
         print("没有输入内容，已退出。", file=sys.stderr)
         return 1
 
-    # 通过修改 agent_params 加载 one_shot 系统提示词文件内容：
-    # 赋值为文件名，setter 会自动读取 prompts/one_shot_system_prompt.md。
-    agent_params.system_prompt = "one_shot_system_prompt"
-    system_prompt = (agent_params.system_prompt or "").strip()
-    if system_prompt:
-        prompt = f"{prompt}\n\n{system_prompt}"
+    response = loop.run(AgentRequest(user_input=prompt))
+    return _print_response(response)
 
-    try:
-        result = complete(max_new_tokens=MODELS_PARAMS.max_tokens, prompt=prompt)
-    except RuntimeError as exc:
-        print(f"连接失败：{exc}", file=sys.stderr)
+
+def _repl(loop: AgentLoop) -> int:
+    """交互式多轮对话：每轮驱动一次主循环，跨轮历史由本层持有。"""
+    history: list[Message] = []
+
+    while True:
+        try:
+            user_input = input("你：").strip()
+        except EOFError:
+            print("已退出。")
+            return 0
+
+        if user_input in ("/exit", "/quit"):
+            print("已退出。")
+            return 0
+
+        if not user_input:
+            print("没有输入内容，请重新输入。")
+            continue
+
+        response = loop.run(
+            AgentRequest(user_input=user_input, messages=history or None)
+        )
+        _print_response(response)
+
+        # 从响应轨迹重建消息（与主循环同一来源 step_to_messages），
+        # 供下一轮作为会话历史。
+        history.append(Message(role="user", content=user_input))
+        for step in response.steps:
+            history.extend(step_to_messages(step))
+
+
+def _print_response(response: AgentResponse) -> int:
+    """按结束原因打印主循环结果，返回进程退出码。"""
+    if response.stop_reason is StopReason.FINAL_ANSWER:
+        print(f"🤖 {response.final_answer}")
+        return 0
+    if response.stop_reason is StopReason.MAX_TURNS:
+        print(f"⚠️ 达到轮数上限（{response.turns_used} 轮），已停止。")
         return 1
-
-    print(f"{result.settings.name}（{result.settings.model}）：{result.answer}")
-    return 0
-
-
+    print(f"❌ 出错：{response.error}")
+    return 1

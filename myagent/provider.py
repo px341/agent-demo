@@ -1,208 +1,106 @@
 """从 .env.llm（或 .env.example 模板）加载 LLM provider，并提供统一调用函数。
 
-调用方（如 cli.py）只需调用 complete() / chat() 即可完成一次 LLM 请求。
 """
 
 from __future__ import annotations
+from openai import OpenAI
+from pathlib import Path
+from dotenv import load_dotenv
 
 import os
-from dataclasses import dataclass
-from pathlib import Path
+import json
+from pydantic import BaseModel
 
 from .agent_config import AgentParams, Message
-from .actions import FinalAnswer, Retry, ToolCall, parse_action
-
+from .contracts import LLMResponse
 
 # 优先读取本地的 .env.llm（真实配置/密钥），缺失时回退到 .env.example 模板。
-ENV_FILES = (
-    Path(__file__).resolve().parent.parent / ".env.llm",
-    Path(__file__).resolve().parent.parent / ".env.example",
+ENV_PATH = (
+    Path(__file__).resolve().parent.parent / ".env.llm"
 )
-DEFAULT_PROVIDER = "deepseek"
-PREFIX_ALIASES = {"claude": "ANTHROPIC", "grok": "XAI"}
+DEFAULT_PROVIDER = "DEEPSEEK"  # 默认使用 DeepSeek provider
+
+print(f"加载 LLM provider 配置：{ENV_PATH}")
+
+load_dotenv(ENV_PATH)
 
 
-@dataclass(frozen=True, slots=True)
-class ProviderSettings:
-    key: str
-    name: str
-    protocol: str
-    api_key_env: str
-    api_key: str | None
-    base_url: str
-    model: str
-    timeout: int
+DeepseekClient = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url=os.getenv("DEEPSEEK_API_BASE"),
+)
+
+DEFAULT_MODEL = "deepseek-v4-flash"
 
 
-@dataclass(frozen=True, slots=True)
-class ChatResult:
-    """一次对话调用的结果，供调用方读取回答与所用配置。"""
-
-    answer: str
-    settings: ProviderSettings
-
-def _env_file() -> Path:
-    """按优先级找到可用的配置文件。"""
-    for path in ENV_FILES:
-        if path.is_file():
-            return path
-    raise RuntimeError("缺少配置文件，请先复制 .env.example 为 .env.llm 并填写。")
+class PlannerResponse(BaseModel):
+    plan: str
+    steps: list[str]
 
 
-def _read_env(path: Path | None = None) -> dict[str, str]:
-    """解析 KEY=VALUE 形式的 env 文件，支持 export 前缀与引号。"""
-    env_file = path or _env_file()
-    values: dict[str, str] = {}
-    for raw_line in env_file.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.removeprefix("export ").split("=", 1)
-        values[key.strip()] = value.strip().strip("'\"")
-    return values
+class OpenAICompatibleModelClient:
+    def __init__(self, agent_params: AgentParams):
+        self.client = DeepseekClient
+        self.agent_params = agent_params
+        self.model = os.getenv("DEEPSEEK_MODEL") or DEFAULT_MODEL
 
+    def complete(
+        self,
+        messages: list[Message],
+        *,
+        max_new_tokens: int | None = None,
+    ) -> LLMResponse:
+        """主循环的模型推理接口：完整消息列表 → 结构化返回（文本 + 元数据）。
 
-def load_provider(provider: str | None = None) -> ProviderSettings:
-    """加载配置；进程环境变量优先，其次 .env 文件，未指定时默认 deepseek。"""
+        使用 OpenAI SDK 的 chat.completions（OpenAI 兼容端点通用格式），
+        消息结构与主循环的 Message 契约一一对应：
+        system / user / assistant 消息原样透传，tool 消息附带 tool_call_id。
 
-    values = _read_env()
+        DeepSeek thinking mode 下 assistant 响应带 ``reasoning_content``，
+        后续请求必须原样回传，否则端点 400；因此这里提取进 metadata，
+        由主循环随 assistant 消息携带回传。
+        """
+        payload = []
+        for message in messages:
+            item = {"role": message.role, "content": message.content or ""}
+            if message.role == "tool" and message.tool_call_id:
+                item["tool_call_id"] = message.tool_call_id
+            if message.tool_calls:
+                item["tool_calls"] = message.tool_calls
+            if message.role == "assistant":
+                reasoning = (message.metadata or {}).get("reasoning_content")
+                if reasoning:
+                    item["reasoning_content"] = reasoning
+            payload.append(item)
 
-    def get(name: str, default: str = "") -> str:
-        return os.getenv(name, values.get(name, default))
-
-    key = (provider or get("PROVIDER", DEFAULT_PROVIDER)).lower()
-    prefix = PREFIX_ALIASES.get(key, key.upper())
-    required = {
-        "protocol": f"{prefix}_API_TYPE",
-        "base_url": f"{prefix}_API_BASE",
-        "model": f"{prefix}_MODEL",
-    }
-    missing = [env_name for env_name in required.values() if not get(env_name)]
-    if missing:
-        raise RuntimeError(f"配置文件缺少 {key} 相关配置：{', '.join(missing)}")
-
-    timeout = get("LLM_TIMEOUT", "60")
-    try:
-        timeout_value = int(timeout)
-        if timeout_value <= 0:
-            raise ValueError
-    except ValueError as exc:
-        raise RuntimeError("LLM_TIMEOUT 必须是大于 0 的整数") from exc
-
-    api_key_env = f"{prefix}_API_KEY"
-    return ProviderSettings(
-        key=key,
-        name=key.title(),
-        protocol=get(required["protocol"]),
-        api_key_env=api_key_env,
-        api_key=get(api_key_env) or None,
-        base_url=get(required["base_url"]),
-        model=get(required["model"]),
-        timeout=timeout_value,
-    )
-
-
-def create_client(provider: str | None = None):
-    """创建配置中指定协议的统一客户端。"""
-
-    from .clients import CLIENTS
-
-    settings = load_provider(provider)
-    try:
-        client_type = CLIENTS[settings.protocol]
-    except KeyError as exc:
-        choices = ", ".join(CLIENTS)
-        raise RuntimeError(
-            f"不支持 API_TYPE {settings.protocol!r}，可选：{choices}"
-        ) from exc
-    return client_type(settings)
-
-
-def complete(
-    prompt: str,
-    provider: str | None = None,
-    max_new_tokens: int = 512,
-) -> ChatResult:
-    """调用 LLM 完成一次对话，供 CLI 等外部调用方直接使用。
-
-    职责链：加载配置 → 创建客户端 → 校验 API Key → 发起请求。
-    失败统一抛出 RuntimeError，由调用方决定如何展示。
-    """
-
-    client = create_client(provider)
-    if not client.settings.api_key:
-        raise RuntimeError(
-            f"未配置 {client.settings.api_key_env}，请在 .env.llm 中设置。"
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=payload,
+            stream=False,
+            max_tokens=max_new_tokens or self.agent_params.max_output_tokens,
+            temperature=0.2,
         )
-    answer = client.complete(prompt, max_new_tokens=max_new_tokens)
-    return ChatResult(answer=answer, settings=client.settings)
 
+        message = response.choices[0].message
+        text = message.content or ""
+        # DeepSeek 在 assistant 消息上扩展了 reasoning_content；
+        # SDK 可能通过属性或 model_extra 暴露，两处都取一下。
+        reasoning = getattr(message, "reasoning_content", None)
+        if reasoning is None and hasattr(message, "model_extra"):
+            reasoning = (message.model_extra or {}).get("reasoning_content")
+        metadata = {"reasoning_content": reasoning} if reasoning else {}
+        return LLMResponse(text=text, metadata=metadata)
 
-def chat(prompt: str, provider: str | None = None) -> str:
-    """轻量便捷函数：只返回回答文本（不关心展示信息时使用）。"""
-
-    return complete(prompt, provider=provider).answer
-
-
-def _message_payload(params: AgentParams, user_input: str) -> list[dict[str, str]]:
-    """把 AgentParams.messages + 本轮输入转成 role/content 消息数组。"""
-    payload: list[dict[str, str]] = []
-    for message in params.messages or []:
-        payload.append({"role": message.role, "content": message.content or ""})
-    if user_input:
-        payload.append({"role": "user", "content": user_input})
-    return payload
-
-
-def agent_turn(
-    params: AgentParams,
-    user_input: str,
-    provider: str | None = None,
-    max_new_tokens: int = 512,
-) -> Message:
-    """多轮对话的一次调用，与单次的 complete() 完全独立。
-
-    职责链：加载配置 → 创建客户端 → 校验 API Key → 发送 messages 数组 → 解析输出。
-    模型输出按 JSON 契约（{"action": "tool_call"|"final"}）解析为
-    ToolCall / FinalAnswer / Retry，并包装成 assistant 的 Message 返回；
-    调用方据此决定执行工具还是收口。
-    """
-    client = create_client(provider)
-    if not client.settings.api_key:
-        raise RuntimeError(
-            f"未配置 {client.settings.api_key_env}，请在 .env.llm 中设置。"
+    def responses_planner(self, input: str = "在目录下创建一个文件夹保存一首诗"):
+        response = self.client.responses.parse(
+            model=self.model,
+            instructions="你是一个planner",
+            input=input,
+            stream=False,
+            max_output_tokens=self.agent_params.max_output_tokens,
+            temperature=0.2,
+            text_format=PlannerResponse,
         )
-    answer = client.chat(
-        _message_payload(params, user_input),
-        system=params.system_prompt,
-        max_new_tokens=max_new_tokens,
-    )
-
-    action = parse_action(answer)
-    message = Message(role="assistant", content=answer)
-
-    if isinstance(action, ToolCall):
-        message.tool_calls = [
-            {"name": action.name, "arguments": action.args, "raw": action.raw}
-        ]
-        message.metadata["action"] = "tool_call"
-    elif isinstance(action, Retry):
-        message.metadata["action"] = "retry"
-        message.metadata["reason"] = action.reason
-    else:  # FinalAnswer
-        message.content = action.text
-        message.metadata["action"] = "final"
-
-    return message
-
-
-def list_providers() -> list[str]:
-    """返回配置文件中声明过的 provider 键（保持出现顺序）。"""
-
-    values = _read_env()
-    keys: list[str] = []
-    for key in values.get("PROVIDER", DEFAULT_PROVIDER).split(","):
-        key = key.strip().lower()
-        if key and key not in keys:
-            keys.append(key)
-    return keys
+        
+        # 直接获取解析后的 Pydantic 对象
+        return response.output_parsed 
