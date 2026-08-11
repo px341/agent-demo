@@ -1,46 +1,46 @@
-"""从 .env.llm（或 .env.example 模板）加载 LLM provider，并提供统一调用函数。
+"""从 .env.llm 加载 LLM provider 配置，并提供统一模型推理接口。
 
+- OpenAI SDK 客户端**懒加载**：import 本模块无副作用（不打印、
+  不构造客户端），首次实例化 OpenAICompatibleModelClient 时才构造；
+- ``OpenAICompatibleModelClient.complete`` 满足 contracts.LLMClient 协议，
+  是主循环唯一的模型调用入口。
 """
-
 from __future__ import annotations
-from openai import OpenAI
-from pathlib import Path
-from dotenv import load_dotenv
 
 import os
-import json
-from pydantic import BaseModel
+from pathlib import Path
+
+from dotenv import load_dotenv
+from openai import OpenAI
 
 from .agent_config import AgentParams, Message
 from .contracts import LLMResponse
 
-# 优先读取本地的 .env.llm（真实配置/密钥），缺失时回退到 .env.example 模板。
-ENV_PATH = (
-    Path(__file__).resolve().parent.parent / ".env.llm"
-)
+# 读取本地的 .env.llm（真实配置/密钥），把变量注入进程环境。
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env.llm"
 DEFAULT_PROVIDER = "DEEPSEEK"  # 默认使用 DeepSeek provider
-
-print(f"加载 LLM provider 配置：{ENV_PATH}")
+DEFAULT_MODEL = "deepseek-v4-flash"
 
 load_dotenv(ENV_PATH)
 
-
-DeepseekClient = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url=os.getenv("DEEPSEEK_API_BASE"),
-)
-
-DEFAULT_MODEL = "deepseek-v4-flash"
+#: 延迟创建的 OpenAI 兼容客户端（首次调用时构造）。
+_client: OpenAI | None = None
 
 
-class PlannerResponse(BaseModel):
-    plan: str
-    steps: list[str]
+def _get_client() -> OpenAI:
+    """按环境变量构造并缓存 OpenAI 兼容客户端（懒加载，避免 import 副作用）。"""
+    global _client
+    if _client is None:
+        _client = OpenAI(
+            api_key=os.getenv("DEEPSEEK_API_KEY"),
+            base_url=os.getenv("DEEPSEEK_API_BASE"),
+        )
+    return _client
 
 
 class OpenAICompatibleModelClient:
     def __init__(self, agent_params: AgentParams):
-        self.client = DeepseekClient
+        self.client = _get_client()
         self.agent_params = agent_params
         self.model = os.getenv("DEEPSEEK_MODEL") or DEFAULT_MODEL
 
@@ -90,17 +90,3 @@ class OpenAICompatibleModelClient:
             reasoning = (message.model_extra or {}).get("reasoning_content")
         metadata = {"reasoning_content": reasoning} if reasoning else {}
         return LLMResponse(text=text, metadata=metadata)
-
-    def responses_planner(self, input: str = "在目录下创建一个文件夹保存一首诗"):
-        response = self.client.responses.parse(
-            model=self.model,
-            instructions="你是一个planner",
-            input=input,
-            stream=False,
-            max_output_tokens=self.agent_params.max_output_tokens,
-            temperature=0.2,
-            text_format=PlannerResponse,
-        )
-        
-        # 直接获取解析后的 Pydantic 对象
-        return response.output_parsed 
