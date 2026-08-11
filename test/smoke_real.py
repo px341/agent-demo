@@ -31,7 +31,9 @@ def run_case(title: str, user_input: str, use_tools: bool) -> None:
         print("final:", resp.final_answer)
     for s in resp.steps:
         obs = (s.observation or "")[:80]
-        print(f"  turn{s.turn}: action={type(s.action).__name__} obs={obs!r}")
+        raw = (s.raw_output or "").replace("\n", " ")[:150]
+        print(f"  turn{s.turn}: {raw}")
+        print(f"           action={type(s.action).__name__} obs={obs!r}")
 
 
 if __name__ == "__main__":
@@ -40,3 +42,9 @@ if __name__ == "__main__":
         run_case("纯对话（无工具）", "用一句话介绍你自己", False)
     if case in ("all", "tool"):
         run_case("工具链路（list_files -> final）", "请查看当前目录下的文件列表，并告诉我有哪些文件", True)
+    if case in ("all", "env"):
+        run_case(
+            "环境感知（直接用 workspace tree，不调工具）",
+            "根据工作区信息，直接告诉我当前目录有哪些顶层文件和目录，不要调用任何工具。",
+            False,
+        )

@@ -216,6 +216,24 @@ class AgentLoopTest(unittest.TestCase):
         rebuilt = step_to_messages(resp.steps[0])
         self.assertEqual(rebuilt[0].metadata, {"reasoning_content": "思考过程"})
 
+    def test_thought_field_ignored_by_parser(self):
+        """prompt 契约含 thought 字段：parse_action 忽略多余字段，主循环正常。"""
+        llm = FakeLLM(
+            [
+                '{"thought": "先看目录结构", "action": "tool_call", "tool": "list_files", "args": {"path": "."}}',
+                '{"thought": "信息充足", "action": "final", "answer": "完成"}',
+            ]
+        )
+        loop = make_loop(llm, tools=FakeTools("目录内容"))
+        resp = loop.run(AgentRequest(user_input="看看目录"))
+
+        self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
+        self.assertEqual(resp.final_answer, "完成")
+        self.assertEqual(resp.tool_calls, 1)
+        # 解析出的 Action 只含契约字段；thought 保留在原始输出中。
+        self.assertEqual(resp.steps[0].action.args, {"path": "."})
+        self.assertIn("thought", resp.steps[0].raw_output)
+
     def test_history_preserved_and_untouched(self):
         history = [Message(role="user", content="旧消息")]
         llm = FakeLLM(['{"action": "final", "answer": "完成"}'])

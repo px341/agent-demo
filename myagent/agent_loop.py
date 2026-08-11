@@ -26,6 +26,7 @@ from .contracts import (
     StopReason,
     ToolExecutor,
 )
+from .environment import build_environment_prompt
 
 
 def step_to_messages(step: StepRecord) -> list[Message]:
@@ -104,6 +105,19 @@ class AgentLoop:
         self.cwd = Path(agent_params.cwd).resolve()
         self.system_prompt = self._load_system_prompt()
 
+    def _build_context_prompt(self) -> str:
+        """拼接本次请求的系统提示：动态环境 prompt + 静态工具 prompt。
+
+        每次 run 重新生成，保证 workspace tree 反映最新工作区状态。
+        """
+        environment = build_environment_prompt(
+            self.agent_params.prompt_dir,
+            self.cwd,
+        )
+        if not environment:
+            return self.system_prompt
+        return environment + "\n\n" + self.system_prompt
+
     def _load_system_prompt(self) -> str:
         """从 prompt_dir 加载系统提示词；文件缺失时回退默认提示词。"""
         prompt_file = Path(self.agent_params.prompt_dir) / "tools_system_prompt.md"
@@ -133,9 +147,11 @@ class AgentLoop:
         # 轮数上限至少为 1，保证返回值契约 turns_used >= 1。
         max_turns = max(1, max_turns)
 
-        # 本次请求的消息上下文：系统提示 + 会话历史 + 当前请求。
+        # 本次请求的消息上下文：系统提示（环境 + 工具） + 会话历史 + 当前请求。
         # 不修改调用方传入的历史（extend 的是新列表）。
-        messages: list[Message] = [Message(role="system", content=self.system_prompt)]
+        messages: list[Message] = [
+            Message(role="system", content=self._build_context_prompt())
+        ]
         if request.messages:
             messages.extend(request.messages)
         messages.append(Message(role="user", content=request.user_input))
