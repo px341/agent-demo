@@ -19,6 +19,7 @@ from .api_config import DEFAULT_SYSTEM_PROMPT
 from .contracts import (
     AgentRequest,
     AgentResponse,
+    ApprovalGate,
     LLMClient,
     LLMResponse,
     MemoryStore,
@@ -27,6 +28,7 @@ from .contracts import (
     ToolExecutor,
 )
 from .environment import build_environment_prompt
+from .tools.render import render_tool_section
 
 
 def step_to_messages(step: StepRecord) -> list[Message]:
@@ -87,7 +89,12 @@ class AgentLoop:
 
     典型用法：:
 
-        loop = AgentLoop(agent_params, llm=client, tools=execute_tool)
+        from myagent.tools import ToolExecutor
+        loop = AgentLoop(
+            agent_params,
+            llm=client,
+            tools=ToolExecutor(cwd=agent_params.cwd),
+        )
         response = loop.run(AgentRequest(user_input="帮我读 a.py"))
     """
 
@@ -97,11 +104,13 @@ class AgentLoop:
         llm: LLMClient,
         tools: ToolExecutor | None = None,
         memory: MemoryStore | None = None,
+        approval_gate: ApprovalGate | None = None,
     ):
         self.agent_params = agent_params
         self.llm = llm
         self.tools = tools
         self.memory = memory
+        self.approval_gate = approval_gate
         self.cwd = Path(agent_params.cwd).resolve()
         self.system_prompt = self._load_system_prompt()
 
@@ -119,12 +128,17 @@ class AgentLoop:
         return environment + "\n\n" + self.system_prompt
 
     def _load_system_prompt(self) -> str:
-        """从 prompt_dir 加载系统提示词；文件缺失时回退默认提示词。"""
+        """从 prompt_dir 加载系统提示词；文件缺失时回退默认提示词。
+
+        ``{tool_list}`` 占位符替换为注册表动态生成的工具列表，
+        保证 prompt 工具清单与 TOOLS 注册表始终一致。
+        """
         prompt_file = Path(self.agent_params.prompt_dir) / "tools_system_prompt.md"
         try:
-            return prompt_file.read_text(encoding="utf-8")
+            text = prompt_file.read_text(encoding="utf-8")
         except OSError:
             return DEFAULT_SYSTEM_PROMPT
+        return text.replace("{tool_list}", render_tool_section())
 
     def run(self, request: AgentRequest) -> AgentResponse:
         """执行一次任务请求，返回最终结果与逐步轨迹。
@@ -196,9 +210,18 @@ class AgentLoop:
                 )
 
             if isinstance(action, ToolCall):
-                observation = self._execute_tool(action)
-                if self.tools is not None:
-                    tool_calls += 1
+                # 审批闸门：工具调用前询问用户，拒绝则不执行、不计调用次数。
+                if self.approval_gate is not None and not self.approval_gate.request(
+                    action.name, action.args
+                ):
+                    observation = (
+                        f"错误：用户拒绝了工具调用 {action.name!r}；"
+                        "请改用其他方式或直接给出最终答案。"
+                    )
+                else:
+                    observation = self._execute_tool(action)
+                    if self.tools is not None:
+                        tool_calls += 1
                 step = StepRecord(
                     turn=turn,
                     raw_output=raw_output,

@@ -53,11 +53,10 @@ class LLMResponse:
 class ToolExecutor(Protocol):
     """工具执行器（可选依赖；None 表示未启用工具）。
 
-    注入示例：tools.py 的 execute_tool 是模块级函数，需要适配成
-    带 ``execute`` 方法的对象：
+    注入示例：tools 包提供满足该协议的执行器：:
 
-        from types import SimpleNamespace
-        tools = SimpleNamespace(execute=execute_tool)
+        from myagent.tools import ToolExecutor
+        tools = ToolExecutor(cwd=".")
     """
 
     def execute(self, name: str, args: dict[str, Any]) -> str: ...
@@ -69,6 +68,17 @@ class MemoryStore(Protocol):
     def retrieve(self, query: str) -> list[str]: ...
 
     def store(self, entry: str) -> None: ...
+
+
+class ApprovalGate(Protocol):
+    """工具调用审批闸门（可选依赖；None 表示不审批、直接执行）。
+
+    主循环在执行每个工具前调用 ``request``：
+    - 返回 True  → 允许执行；
+    - 返回 False → 拒绝执行，观察文本提示用户拒绝，模型继续推理。
+    """
+
+    def request(self, name: str, args: dict[str, Any]) -> bool: ...
 
 
 @dataclass(slots=True)

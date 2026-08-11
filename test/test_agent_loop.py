@@ -53,9 +53,19 @@ class FakeTools:
         return self.result
 
 
-def make_loop(llm, tools=None, **params_overrides) -> AgentLoop:
+def make_loop(
+    llm,
+    tools=None,
+    approval_gate=None,
+    **params_overrides,
+) -> AgentLoop:
     params = AgentParams(**params_overrides)
-    return AgentLoop(params, llm=llm, tools=tools)
+    return AgentLoop(
+        params,
+        llm=llm,
+        tools=tools,
+        approval_gate=approval_gate,
+    )
 
 
 class AgentLoopTest(unittest.TestCase):
@@ -233,6 +243,74 @@ class AgentLoopTest(unittest.TestCase):
         # 解析出的 Action 只含契约字段；thought 保留在原始输出中。
         self.assertEqual(resp.steps[0].action.args, {"path": "."})
         self.assertIn("thought", resp.steps[0].raw_output)
+
+    def test_approval_gate_denies_tool_call(self):
+        """审批拒绝：不执行工具、不计 tool_calls、观察提示用户拒绝、模型继续。"""
+        tools = FakeTools("文件内容")
+
+        class Gate:
+            def __init__(self, calls):
+                self.calls = calls
+
+            def request(self, name, args):
+                self.calls.append((name, args))
+                return False
+
+        gate = Gate([])
+        llm = FakeLLM(
+            [
+                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
+                '{"action": "final", "answer": "被拒后直接回答"}',
+            ]
+        )
+        loop = make_loop(llm, tools=tools, approval_gate=gate)
+        resp = loop.run(AgentRequest(user_input="读文件"))
+
+        self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
+        self.assertEqual(resp.final_answer, "被拒后直接回答")
+        self.assertEqual(resp.tool_calls, 0)
+        # 工具未执行，闸门被询问且收到拒绝。
+        self.assertEqual(tools.calls, [])
+        self.assertEqual(gate.calls, [("read_file", {"path": "a.py"})])
+        # 观察文本提示用户拒绝，模型能看到。
+        self.assertIn("用户拒绝", resp.steps[0].observation)
+
+    def test_approval_gate_allows_tool_call(self):
+        """审批允许：正常执行、计入 tool_calls。"""
+
+        class Gate:
+            def request(self, name, args):
+                return True
+
+        tools = FakeTools("文件内容")
+        llm = FakeLLM(
+            [
+                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
+                '{"action": "final", "answer": "读完"}',
+            ]
+        )
+        loop = make_loop(llm, tools=tools, approval_gate=Gate())
+        resp = loop.run(AgentRequest(user_input="读文件"))
+
+        self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
+        self.assertEqual(resp.tool_calls, 1)
+        self.assertEqual(tools.calls, [("read_file", {"path": "a.py"})])
+
+    def test_no_gate_executes_without_asking(self):
+        """approval_gate=None（默认）：不询问直接执行（既有行为）。"""
+        tools = FakeTools("文件内容")
+        llm = FakeLLM(
+            [
+                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
+                '{"action": "final", "answer": "读完"}',
+            ]
+        )
+        loop = make_loop(llm, tools=tools)  # 不传 approval_gate
+        resp = loop.run(AgentRequest(user_input="读文件"))
+
+        self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
+        self.assertEqual(resp.tool_calls, 1)
+        self.assertEqual(tools.calls, [("read_file", {"path": "a.py"})])
 
     def test_history_preserved_and_untouched(self):
         history = [Message(role="user", content="旧消息")]

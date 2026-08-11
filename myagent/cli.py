@@ -10,9 +10,11 @@ from pathlib import Path
 
 from .agent_config import AgentParams, Message
 from .agent_loop import AgentLoop, step_to_messages
+from .approval import ConsoleApprovalGate
 from .argparse import parse_args
 from .contracts import AgentRequest, AgentResponse, StopReason
 from .provider import OpenAICompatibleModelClient
+from .tools import ToolExecutor
 
 
 
@@ -47,9 +49,15 @@ def main() -> int:
         print(f"无法进入工作目录 {args.cwd!r}：{exc}", file=sys.stderr)
         return 1
 
-    # 装配主循环：LLM 用 OpenAI SDK 客户端；工具/记忆后续按 Protocol 注入。
+    # 装配主循环：LLM 用 OpenAI SDK 客户端；工具用注册表执行器（工作目录内）；
+    # 每次工具调用前经命令行审批闸门询问用户 y/n。
     client = OpenAICompatibleModelClient(agent_params)
-    loop = AgentLoop(agent_params, llm=client)
+    loop = AgentLoop(
+        agent_params,
+        llm=client,
+        tools=ToolExecutor(agent_params.cwd),
+        approval_gate=ConsoleApprovalGate(),
+    )
 
     # 两种模式：--one_shot 调用一次；否则进入交互式多轮。
     if args.one_shot:

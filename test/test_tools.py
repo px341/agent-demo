@@ -1,0 +1,276 @@
+"""工具系统测试：注册表、执行器、文件/目录工具、路径安全边界。
+
+全部在临时目录内执行，不触网、不触碰真实工作区。
+"""
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from myagent.tools import TOOLS, ToolExecutor, list_tools, register_tool
+from myagent.tools.render import render_tool_section
+
+EXPECTED_TOOLS = {
+    "read_file",
+    "create_file",
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "list_files",
+    "create_dir",
+    "write_dir",
+    "rename_dir",
+    "delete_dir",
+}
+
+
+class RegistryTest(unittest.TestCase):
+    def test_builtin_tools_registered(self):
+        self.assertEqual(set(TOOLS), EXPECTED_TOOLS)
+
+    def test_list_tools_sorted(self):
+        names = list_tools()
+        self.assertEqual(names, sorted(names))
+        self.assertEqual(set(names), EXPECTED_TOOLS)
+
+    def test_tool_spec_metadata(self):
+        spec = TOOLS["read_file"]
+        self.assertEqual(spec.name, "read_file")
+        self.assertIn("读取", spec.description)
+        self.assertIn("path", spec.parameters)
+
+    def test_risk_levels(self):
+        """风险等级标注：read 只读 / write 写入 / delete 破坏性。"""
+        self.assertEqual(TOOLS["read_file"].risk, "read")
+        self.assertEqual(TOOLS["list_files"].risk, "read")
+        self.assertEqual(TOOLS["write_file"].risk, "write")
+        self.assertEqual(TOOLS["create_file"].risk, "write")
+        self.assertEqual(TOOLS["edit_file"].risk, "write")
+        self.assertEqual(TOOLS["create_dir"].risk, "write")
+        self.assertEqual(TOOLS["write_dir"].risk, "write")
+        self.assertEqual(TOOLS["rename_dir"].risk, "write")
+        self.assertEqual(TOOLS["delete_file"].risk, "delete")
+        self.assertEqual(TOOLS["delete_dir"].risk, "delete")
+
+    def test_register_decorator(self):
+        @register_tool("_test_tmp_tool", description="临时")
+        def _tmp(args, cwd):
+            return "ok"
+
+        self.assertIn("_test_tmp_tool", TOOLS)
+        self.assertEqual(TOOLS["_test_tmp_tool"].description, "临时")
+        del TOOLS["_test_tmp_tool"]
+
+    def test_register_rejects_unknown_risk(self):
+        with self.assertRaises(ValueError):
+            register_tool("_bad_risk", risk="explode")
+
+        self.assertNotIn("_bad_risk", TOOLS)
+
+
+class ExecutorTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.executor = ToolExecutor(self._tmp.name)
+
+    def test_unknown_tool(self):
+        out = self.executor.execute("no_such_tool", {})
+        self.assertTrue(out.startswith("错误：未知工具"))
+        self.assertIn("read_file", out)
+
+    def test_missing_required_param(self):
+        out = self.executor.execute("read_file", {})
+        self.assertIn("缺少参数", out)
+        self.assertIn("path", out)
+
+    def test_param_type_validation(self):
+        out = self.executor.execute("read_file", {"path": 123})
+        self.assertIn("必须是字符串", out)
+        out = self.executor.execute("delete_dir", {"path": "d", "recursive": "yes"})
+        self.assertIn("必须是布尔值", out)
+        out = self.executor.execute("read_file", {"path": "a.py", "start_line": "x"})
+        self.assertIn("必须是整数", out)
+        # bool 是 int 子类，需显式拒绝。
+        out = self.executor.execute("read_file", {"path": "a.py", "start_line": True})
+        self.assertIn("必须是整数", out)
+
+    def test_error_as_observation_text(self):
+        out = self.executor.execute("read_file", {"path": "missing.txt"})
+        self.assertTrue(out.startswith("错误：文件不存在"))
+
+    def test_render_tool_section(self):
+        """动态渲染的工具段应覆盖全部注册工具，且不含未注册名。"""
+        section = render_tool_section()
+        for name in EXPECTED_TOOLS:
+            self.assertIn(f"### {name}", section)
+            self.assertIn(f'"tool": "{name}"', section)
+        self.assertNotIn("list_dir", section)
+        self.assertNotIn("{tool_list}", section)
+
+    def test_execute_does_not_raise(self):
+        for name in EXPECTED_TOOLS:
+            args = {"path": "x", "content": "c", "old_text": "a", "new_text": "b",
+                    "src": "a", "dst": "b", "recursive": True, "start_line": 1}
+            out = self.executor.execute(name, args)
+            self.assertIsInstance(out, str)
+
+
+class FileToolsTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.executor = ToolExecutor(self.root)
+
+    def test_read_create_write_edit_delete_flow(self):
+        # create
+        out = self.executor.execute("create_file", {"path": "a.txt", "content": "hello world"})
+        self.assertIn("已创建", out)
+        self.assertTrue((self.root / "a.txt").is_file())
+        # create 已存在 → 失败
+        out = self.executor.execute("create_file", {"path": "a.txt"})
+        self.assertTrue(out.startswith("错误：文件已存在"))
+        # write 覆盖
+        self.executor.execute("write_file", {"path": "a.txt", "content": "hello myagent\n第二行"})
+        self.assertEqual((self.root / "a.txt").read_text(), "hello myagent\n第二行")
+        # read（含行区间）
+        out = self.executor.execute("read_file", {"path": "a.txt", "start_line": 1, "end_line": 1})
+        self.assertIn("hello myagent", out)
+        self.assertIn("第 1-1 行", out)
+        # edit 唯一匹配
+        out = self.executor.execute("edit_file", {"path": "a.txt", "old_text": "myagent", "new_text": "agent"})
+        self.assertIn("已修改", out)
+        self.assertIn("hello agent", (self.root / "a.txt").read_text())
+        # delete
+        out = self.executor.execute("delete_file", {"path": "a.txt"})
+        self.assertIn("已删除", out)
+        self.assertFalse((self.root / "a.txt").exists())
+        # delete 不存在 → 错误
+        out = self.executor.execute("delete_file", {"path": "a.txt"})
+        self.assertTrue(out.startswith("错误：文件不存在"))
+
+    def test_edit_requires_unique_match(self):
+        self.executor.execute("write_file", {"path": "b.txt", "content": "x x x"})
+        out = self.executor.execute("edit_file", {"path": "b.txt", "old_text": "x", "new_text": "y"})
+        self.assertIn("出现 3 次", out)
+
+    def test_write_file_creates_parents(self):
+        self.executor.execute("write_file", {"path": "deep/nested/f.txt", "content": "hi"})
+        self.assertTrue((self.root / "deep" / "nested" / "f.txt").is_file())
+
+
+class DirToolsTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.executor = ToolExecutor(self.root)
+
+    def test_list_create_write_rename_delete_flow(self):
+        # create_dir 单层（父目录是根，存在）
+        self.executor.execute("create_dir", {"path": "d1"})
+        self.assertTrue((self.root / "d1").is_dir())
+        # create_dir 父目录缺失 → 提示用 write_dir
+        out = self.executor.execute("create_dir", {"path": "x/y"})
+        self.assertIn("write_dir", out)
+        # write_dir 递归
+        self.executor.execute("write_dir", {"path": "a/b/c"})
+        self.assertTrue((self.root / "a" / "b" / "c").is_dir())
+        # 写入文件后 list_files 应显示
+        self.executor.execute("write_file", {"path": "d1/f.txt", "content": "x"})
+        out = self.executor.execute("list_files", {"path": "d1"})
+        self.assertIn("f.txt", out)
+        # rename_dir
+        out = self.executor.execute("rename_dir", {"src": "d1", "dst": "d2"})
+        self.assertIn("已重命名", out)
+        self.assertTrue((self.root / "d2").is_dir())
+        self.assertFalse((self.root / "d1").exists())
+        # delete_dir 非空默认失败
+        out = self.executor.execute("delete_dir", {"path": "d2"})
+        self.assertIn("非空", out)
+        # delete_dir 递归
+        out = self.executor.execute("delete_dir", {"path": "d2", "recursive": True})
+        self.assertIn("递归", out)
+        self.assertFalse((self.root / "d2").exists())
+        # delete_dir 空目录
+        self.executor.execute("create_dir", {"path": "empty"})
+        out = self.executor.execute("delete_dir", {"path": "empty"})
+        self.assertIn("已删除", out)
+
+    def test_list_files_empty(self):
+        out = self.executor.execute("list_files", {"path": "."})
+        self.assertIn("空目录", out)
+
+
+class PathSafetyTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.outside = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: self.outside and self.outside.exists() and None)
+        self.executor = ToolExecutor(self.root)
+
+    def test_parent_traversal_rejected(self):
+        out = self.executor.execute("read_file", {"path": "../outside.txt"})
+        self.assertIn("路径越界", out)
+
+    def test_absolute_path_outside_rejected(self):
+        outside_file = self.outside / "secret.txt"
+        outside_file.write_text("secret")
+        out = self.executor.execute("read_file", {"path": str(outside_file)})
+        self.assertIn("路径越界", out)
+
+    def test_relative_path_inside_allowed(self):
+        (self.root / "in.txt").write_text("ok")
+        out = self.executor.execute("read_file", {"path": "in.txt"})
+        self.assertIn("ok", out)
+
+    def test_delete_rejects_escape(self):
+        out = self.executor.execute("delete_file", {"path": "../victim.txt"})
+        self.assertIn("路径越界", out)
+
+    def test_symlink_escape_rejected(self):
+        """symlink 指向 cwd 之外：resolve 展开后应被拒。"""
+        outside_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: outside_dir.exists() and __import__("shutil").rmtree(outside_dir))
+        (outside_dir / "secret.txt").write_text("secret")
+        link = self.root / "link"
+        link.symlink_to(outside_dir, target_is_directory=True)
+
+        out = self.executor.execute("read_file", {"path": "link/secret.txt"})
+        self.assertIn("路径越界", out)
+
+    def test_relative_path_resolution_inside(self):
+        """sub/../in.txt 这类合法回落路径应放行（解析后仍在 cwd 内）。"""
+        (self.root / "sub").mkdir()
+        (self.root / "in.txt").write_text("ok")
+        out = self.executor.execute("read_file", {"path": "sub/../in.txt"})
+        self.assertIn("ok", out)
+
+    def test_invalid_param_value_is_param_error(self):
+        (self.root / "a.txt").write_text("line1\nline2")
+        out = self.executor.execute(
+            "read_file", {"path": "a.txt", "start_line": "abc"}
+        )
+        # schema 校验更早拦截：类型错误在 int() 转换前被拒绝。
+        self.assertIn("必须是整数", out)
+
+    def test_delete_dir_rejects_cwd(self):
+        out = self.executor.execute("delete_dir", {"path": "."})
+        self.assertIn("禁止删除工作目录本身", out)
+        out = self.executor.execute("delete_dir", {"path": ".", "recursive": True})
+        self.assertIn("禁止删除工作目录本身", out)
+
+    def test_rename_dir_rejects_cwd(self):
+        out = self.executor.execute("rename_dir", {"src": ".", "dst": "moved"})
+        self.assertIn("禁止重命名工作目录本身", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
