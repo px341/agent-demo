@@ -3,6 +3,8 @@
 .vscode/
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
 
 # Local secrets
 .env
