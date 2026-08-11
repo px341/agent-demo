@@ -9,3 +9,4 @@ __pycache__/
 .env.*
 .storage
 architecture.md
+.reasonix
