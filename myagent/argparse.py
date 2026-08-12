@@ -16,11 +16,6 @@ def build_parser() -> argparse.ArgumentParser:
         description="AI Agent Terminal",
     )
     parser.add_argument(
-        "--one_shot",
-        action="store_true",
-        help="one_shot 模式：只调用一次 LLM，提示词由用户输入；不加则进入交互式多轮",
-    )
-    parser.add_argument(
         "--cwd",
         default=".",
         metavar="DIR",

@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-STORAGE_DIR = BASE_DIR / ".storage"
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 MEMORY_DIR = BASE_DIR / "memories"
 
@@ -21,15 +20,6 @@ class AgentParams:
 
     # 工作目录：myagent 运行时的当前工作目录，默认为 "."。
     cwd: str = "."
-
-    # 工具列表：用于存放可用工具的列表，默认为 None。
-    tools: list[str] = None
-
-    # 消息历史记录：用于存放消息历史记录的列表，默认为 None。
-    messages: list[Message] = None
-
-    # 是否可以使用工具：用于指示是否可以使用工具，默认为 False。
-    can_use_tools: bool = False
 
     # token 限制：用于限制消息的最大长度，默认为 128000。
     max_input_tokens: int = 128000
@@ -44,9 +34,6 @@ class AgentParams:
 
     # 上下文压缩：历史中所有 tool 输出的总 token 上限（超出丢弃最早结果）。
     max_total_tool_tokens: int = 30000
-
-    # 对话历史存储目录：本地永久化保存对话的文件夹路径，默认为 STORAGE_DIR。
-    storage_dir: str = STORAGE_DIR
 
     # 记忆存档目录：会话原文 jsonl + 摘要 + .state 水位线；空串表示不启用记忆。
     memory_dir: str = MEMORY_DIR

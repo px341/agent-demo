@@ -1,9 +1,9 @@
-"""cli 接线测试：REPL / one_shot 的流程与跨轮历史重建。
+"""cli 接线测试：REPL 的流程与跨轮历史重建。
 
 用 FakeLoop 替代真实 AgentLoop（不触网），验证：
 - REPL 每轮调用 loop.run(AgentRequest)，并维护跨轮历史；
 - /exit /quit 退出；空输入提示后继续；
-- one_shot 只跑一次并正确返回退出码；
+- _trim_history 配对安全裁剪；
 - _print_response 按结束原因返回 0/1。
 """
 from __future__ import annotations
@@ -16,8 +16,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from myagent.actions import FinalAnswer, Retry, ToolCall
+from myagent.agent_config import Message
 from myagent.contracts import AgentRequest, AgentResponse, StepRecord, StopReason
-from myagent.cli import _one_shot, _print_response, _repl
+from myagent.cli import _print_response, _repl, _trim_history
 
 
 class FakeLoop:
@@ -144,21 +145,6 @@ class CliReplTest(unittest.TestCase):
         self.assertEqual(history[2].content, retry_step.observation)
         self.assertIsNone(history[2].tool_call_id)
 
-    def test_one_shot(self):
-        loop = FakeLoop([final_response("答案")])
-        with mock.patch("builtins.input", return_value="任务描述"):
-            code = _one_shot(loop)
-        self.assertEqual(code, 0)
-        self.assertEqual(loop.requests[0].user_input, "任务描述")
-        self.assertIsNone(loop.requests[0].messages)
-
-    def test_one_shot_empty_input(self):
-        loop = FakeLoop([])
-        with mock.patch("builtins.input", return_value="  "):
-            code = _one_shot(loop)
-        self.assertEqual(code, 1)
-        self.assertEqual(loop.requests, [])
-
     def test_print_response_exit_codes(self):
         self.assertEqual(_print_response(final_response("好")), 0)
         self.assertEqual(
@@ -184,6 +170,71 @@ class CliReplTest(unittest.TestCase):
             ),
             1,
         )
+
+
+class TrimHistoryTest(unittest.TestCase):
+    """_trim_history 配对安全裁剪。"""
+
+    def _assistant_call(self, call_id: str) -> StepRecord:
+        return StepRecord(
+            turn=1,
+            raw_output=f'{{"action": "tool_call", "tool": "read_file"}}',
+            action=ToolCall(name="read_file", args={}, raw=""),
+            observation="内容",
+        )
+
+    def test_within_limit_unchanged(self):
+        history = [Message(role="user", content="a"), Message(role="assistant", content="b")]
+        self.assertEqual(_trim_history(history, limit=10), history)
+
+    def test_trims_oldest_when_over_limit(self):
+        history = [Message(role="user", content=f"m{i}") for i in range(5)]
+        kept = _trim_history(history, limit=3)
+        self.assertEqual([m.content for m in kept], ["m2", "m3", "m4"])
+
+    def test_trims_leading_orphan_tool(self):
+        # 开头残留孤儿 tool 结果（无配对声明）→ 被清理。
+        history = [
+            Message(role="tool", content="孤儿结果"),
+            Message(role="user", content="m0"),
+            Message(role="user", content="m1"),
+            Message(role="user", content="m2"),
+        ]
+        kept = _trim_history(history, limit=3)
+        self.assertNotEqual(kept[0].role, "tool")
+        self.assertEqual([m.content for m in kept], ["m0", "m1", "m2"])
+
+    def test_trims_trailing_orphan_tool_calls(self):
+        # 结尾残留孤儿 tool_calls 声明（配对结果被截掉）→ 删除。
+        # 保留最近 limit 条 = [m1, assistant]，孤儿声明删除后只剩 m1
+        # （正确性优先于数量，允许裁剪后少于 limit）。
+        history = [
+            Message(role="user", content="m0"),
+            Message(role="user", content="m1"),
+            Message(
+                role="assistant",
+                content='{"action": "tool_call"}',
+                tool_calls=[{"id": "call_9", "type": "function", "function": {}}],
+            ),
+        ]
+        kept = _trim_history(history, limit=2)
+        self.assertEqual([m.role for m in kept], ["user"])
+        self.assertEqual(kept[0].content, "m1")
+
+    def test_paired_tool_kept_intact(self):
+        # 完整配对的 assistant 声明 + tool 结果保留。
+        history = [
+            Message(role="user", content="m0"),
+            Message(
+                role="assistant",
+                content='{"action": "tool_call"}',
+                tool_calls=[{"id": "call_1", "type": "function", "function": {}}],
+            ),
+            Message(role="tool", content="结果", tool_call_id="call_1"),
+        ]
+        kept = _trim_history(history, limit=3)
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(kept[2].tool_call_id, "call_1")
 
 
 if __name__ == "__main__":

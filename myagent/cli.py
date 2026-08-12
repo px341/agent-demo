@@ -60,6 +60,9 @@ def main() -> int:
     memory = None
     if not args.no_memory:
         memory = MemoryManager(memory_dir=agent_params.memory_dir, llm=client)
+        # 启动扫描：汇总上次启动前结束的历史会话（mtime 水位线幂等，
+        # 失败自动重试），产出跨会话 summary.md 供本轮注入。
+        _sweep_memory(memory)
 
     # 上下文压缩：--no_compose 禁用；否则按预算压缩输入上下文
     # （system+memory / 本轮 session / 用户输入）。
@@ -81,30 +84,20 @@ def main() -> int:
         composer=composer,
     )
 
-    # 两种模式：--one_shot 调用一次；否则进入交互式多轮。
-    if args.one_shot:
-        return _one_shot(loop, memory)
     return _repl(loop, memory)
 
 
-def _one_shot(loop: AgentLoop, memory: MemoryManager | None = None) -> int:
-    """one_shot 模式：只跑一次 ReAct 任务，提示词由用户直接输入。"""
+def _sweep_memory(memory: MemoryManager) -> None:
+    """启动时汇总历史会话记忆；失败只警告，不阻断启动。
+
+    sweep 内部已做幂等（mtime 水位线）与失败重试（.state retry≤3），
+    这里只负责兜底：任何意外异常都不应阻止用户进入会话。
+    """
+    print("正在汇总历史会话记忆…")
     try:
-        prompt = input("你：").strip()
-    except EOFError:
-        prompt = ""
-
-    if not prompt:
-        print("没有输入内容，已退出。", file=sys.stderr)
-        return 1
-
-    if memory is not None:
-        memory.append_message(Message(role="user", content=prompt))
-    response = loop.run(AgentRequest(user_input=prompt))
-    if memory is not None:
-        _archive_steps(memory, response)
-        memory.close_session()
-    return _print_response(response)
+        memory.sweep()
+    except Exception as exc:
+        print(f"⚠️ 历史会话汇总失败（不影响本次会话）：{exc}", file=sys.stderr)
 
 
 def _repl(loop: AgentLoop, memory: MemoryManager | None = None) -> int:
@@ -145,10 +138,11 @@ def _repl(loop: AgentLoop, memory: MemoryManager | None = None) -> int:
         _print_response(response)
 
         # 从响应轨迹重建消息（与主循环同一来源 step_to_messages），
-        # 供下一轮作为会话历史。
+        # 供下一轮作为会话历史；超出上限时配对安全裁剪。
         history.append(Message(role="user", content=user_input))
         for step in response.steps:
             history.extend(step_to_messages(step))
+        history = _trim_history(history)
 
 
 def _archive_steps(memory: MemoryManager, response: AgentResponse) -> None:
@@ -156,6 +150,41 @@ def _archive_steps(memory: MemoryManager, response: AgentResponse) -> None:
     for step in response.steps:
         for message in step_to_messages(step):
             memory.append_message(message)
+
+
+#: REPL 持有的会话历史消息数上限（超出后保留最近，配对被安全裁剪）。
+MAX_HISTORY_MESSAGES = 300
+
+
+def _trim_history(history: list[Message], limit: int = MAX_HISTORY_MESSAGES) -> list[Message]:
+    """按消息数上限裁剪 REPL 会话历史，保证不产生孤儿消息。
+
+    规则：
+    1. 超限时保留最近 ``limit`` 条；
+    2. 开头若残留孤儿 tool 结果（role=tool 但前面没有配对的
+       assistant tool_calls 声明）→ 继续删；
+    3. 结尾若残留孤儿 tool_calls 声明（role=assistant 带 tool_calls 但
+       配对结果被截掉）→ 删除该声明。
+    以上保证裁剪后的历史对 OpenAI 兼容端点合法（tool 消息必须配对
+    前置的 assistant tool_calls 声明）。
+    """
+    if len(history) <= limit:
+        return history
+
+    kept = history[-limit:]
+
+    # 2. 修复开头孤儿 tool 结果：从头删到第一个非 tool 消息。
+    start = 0
+    while start < len(kept) and kept[start].role == "tool":
+        start += 1
+    kept = kept[start:]
+
+    # 3. 修复结尾孤儿 tool_calls 声明：末尾带 tool_calls 的 assistant
+    #    若无配对 tool 结果则删除（它后面的工具结果已被截掉）。
+    while kept and kept[-1].role == "assistant" and kept[-1].tool_calls:
+        kept = kept[:-1]
+
+    return kept
 
 
 def _print_response(response: AgentResponse) -> int:

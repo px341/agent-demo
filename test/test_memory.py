@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from myagent.actions import FinalAnswer, ToolCall
 from myagent.agent_config import AgentParams, Message
 from myagent.agent_loop import AgentLoop
-from myagent.cli import _archive_steps, _one_shot, _repl
+from myagent.cli import _archive_steps, _repl, _sweep_memory
 from myagent.contracts import (
     AgentRequest,
     AgentResponse,
@@ -689,7 +689,7 @@ class SummarizerDirectTest(unittest.TestCase):
 
 
 class CliMemoryTest(unittest.TestCase):
-    """REPL / one_shot 的记忆接线：每轮存档消息、退出标记会话。"""
+    """REPL 的记忆接线：每轮存档消息、退出标记会话；启动 sweep。"""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -720,24 +720,6 @@ class CliMemoryTest(unittest.TestCase):
         self.assertTrue(memory.closed)
         self.assertEqual(memory.appended, [])
 
-    def test_one_shot_archives_and_closes(self):
-        step = StepRecord(
-            turn=1,
-            raw_output='{"action": "final", "answer": "完成"}',
-            action=FinalAnswer(text="完成"),
-        )
-        loop = FakeLoop([final_response("完成", [step])])
-        memory = FakeMemory()
-        with mock.patch("builtins.input", return_value="任务描述"):
-            code = _one_shot(loop, memory)
-        self.assertEqual(code, 0)
-        self.assertTrue(memory.closed)
-        # assistant 消息存档内容与 step_to_messages 一致（携带模型原始输出）。
-        self.assertEqual(
-            [m.content for m in memory.appended],
-            ["任务描述", '{"action": "final", "answer": "完成"}'],
-        )
-
     def test_archive_steps_appends_tool_pair(self):
         memory = FakeMemory()
         raw = '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}'
@@ -758,6 +740,31 @@ class CliMemoryTest(unittest.TestCase):
             code = _repl(loop)
         self.assertEqual(code, 0)
         self.assertEqual(len(loop.requests), 1)
+
+
+class SweepGateTest(unittest.TestCase):
+    """_sweep_memory 启动接线：正常调用 sweep、异常不阻断启动。"""
+
+    class _SweepMemory:
+        def __init__(self):
+            self.calls = 0
+
+        def sweep(self):
+            self.calls += 1
+
+    class _BoomMemory:
+        def sweep(self):
+            raise RuntimeError("boom")
+
+    def test_sweep_called(self):
+        memory = self._SweepMemory()
+        _sweep_memory(memory)
+        self.assertEqual(memory.calls, 1)
+
+    def test_sweep_exception_swallowed(self):
+        with mock.patch("sys.stderr") as stderr:
+            _sweep_memory(self._BoomMemory())
+        stderr.write.assert_called()  # 警告输出到 stderr，不抛出
 
 
 class FakeLoop:
