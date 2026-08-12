@@ -47,3 +47,33 @@ class ConsoleApprovalGate:
             if answer in DENIED:
                 return False
             print("请输入 y（允许）或 n（拒绝）")
+
+    def request_batch(self, calls: list[tuple[str, dict[str, Any]]]) -> bool:
+        """一次性审批多个工具调用（并行）。
+
+        全部为免审风险（默认 read）时直接放行；否则一次性列出全部调用
+        与参数询问用户 y/n。
+        """
+        for name, _ in calls:
+            spec = TOOLS.get(name)
+            if spec is None or spec.risk not in self.auto_approve_risks:
+                break
+        else:
+            return True
+
+        lines = []
+        for name, args in calls:
+            args_text = json.dumps(args, ensure_ascii=False) if args else ""
+            lines.append(f"  - {name}（{args_text}）")
+        prompt = "是否允许调用以下工具？\n" + "\n".join(lines) + "\n[y/n] "
+        while True:
+            try:
+                answer = input(prompt).strip().lower()
+            except EOFError:
+                print("（输入中止，默认拒绝）")
+                return False
+            if answer in ALLOWED:
+                return True
+            if answer in DENIED:
+                return False
+            print("请输入 y（允许）或 n（拒绝）")

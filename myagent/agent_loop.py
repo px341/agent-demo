@@ -1,12 +1,18 @@
 """ReAct 主循环：一次任务请求驱动「思考→行动→观察」循环，返回最终结果。
 
-输入 / 输出契约见 contracts.py。依赖通过 Protocol 注入：
+输入 / 输出契约见 contracts.py。模型输出走 OpenAI 原生 tool_calls 协议：
+每轮 ``llm.complete(messages, tools=...)`` 返回结构化 ``LLMResponse``，
+主循环按 ``tool_calls`` 执行（并行多调用一次执行），结果以 role=tool
+消息回灌；无 tool_calls 的轮即最终答案。
+
+依赖通过 Protocol 注入：
 
 - ``llm``：LLMClient（必需）—— 唯一的模型调用入口；
 - ``tools``：ToolExecutor（可选，None 表示未启用工具）；
-- ``memory``：MemoryStore（可选，None 表示未启用记忆）。
+- ``memory``：MemoryStore（可选，None 表示未启用记忆）；
+- ``composer``：ContextComposer（可选，None 表示不压缩上下文）。
 
-工具执行、记忆的具体实现各自接入，主循环只感知注入接口：
+工具执行、记忆、上下文压缩的具体实现各自接入，主循环只感知注入接口：
 memory 的聚合摘要经 ``context_block()`` 前置进 system prompt。
 """
 from __future__ import annotations
@@ -14,7 +20,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .actions import FinalAnswer, Retry, ToolCall, parse_action
 from .agent_config import AgentParams, Message
 from .api_config import DEFAULT_SYSTEM_PROMPT
 from .contracts import (
@@ -30,59 +35,42 @@ from .contracts import (
     ToolExecutor,
 )
 from .environment import build_environment_prompt
-from .tools.render import render_tool_section
+from .tools.registry import to_openai_tools
 
 
 def step_to_messages(step: StepRecord) -> list[Message]:
-    """把一步轨迹重建为 LLM 消息（assistant + 可选反馈）。
+    """把一步轨迹重建为 LLM 消息（assistant + 工具结果回灌）。
 
-    - ToolCall：assistant 携带原生 tool_calls 声明（id=call_{turn}），
-      工具结果以 role=tool + tool_call_id 回灌；OpenAI 兼容 API 要求
-      tool 消息必须配对前置 assistant 消息的 tool_calls 声明；
-    - Retry：输出不合法的反馈以 role=user 回灌（不伪造工具调用）；
-    - FinalAnswer：仅 assistant 消息。
+    与主循环发给 LLM 的轮内消息同构：
+    - 工具轮：assistant 携带原生 tool_calls 声明（id 由模型返回），
+      每个工具结果以 role=tool + 对应 tool_call_id 回灌（OpenAI 兼容 API
+      要求 tool 消息必须配对前置 assistant 消息的 tool_calls 声明）；
+    - 最终答案轮：仅 assistant 消息（text 即答案）。
     """
 
-    if isinstance(step.action, ToolCall):
+    if not step.tool_calls:
         return [
             Message(
                 role="assistant",
                 content=step.raw_output,
                 metadata=dict(step.assistant_metadata),
-                tool_calls=[
-                    {
-                        "id": f"call_{step.turn}",
-                        "type": "function",
-                        "function": {
-                            "name": step.action.name,
-                            "arguments": json.dumps(
-                                step.action.args, ensure_ascii=False
-                            ),
-                        },
-                    }
-                ],
-            ),
-            Message(
-                role="tool",
-                content=step.observation or "",
-                tool_call_id=f"call_{step.turn}",
-            ),
-        ]
-    if isinstance(step.action, Retry):
-        return [
-            Message(
-                role="assistant",
-                content=step.raw_output,
-                metadata=dict(step.assistant_metadata),
-            ),
-            Message(role="user", content=step.observation or ""),
+            )
         ]
     return [
         Message(
             role="assistant",
             content=step.raw_output,
             metadata=dict(step.assistant_metadata),
-        )
+            tool_calls=list(step.tool_calls),
+        ),
+        *[
+            Message(
+                role="tool",
+                content=observation or "",
+                tool_call_id=call.get("id"),
+            )
+            for call, observation in zip(step.tool_calls, step.observations)
+        ],
     ]
 
 
@@ -142,30 +130,24 @@ class AgentLoop:
         return "\n\n".join(parts) + "\n\n" + self.system_prompt
 
     def _load_system_prompt(self) -> str:
-        """从 prompt_dir 加载系统提示词；文件缺失时回退默认提示词。
-
-        ``{tool_list}`` 占位符替换为注册表动态生成的工具列表，
-        保证 prompt 工具清单与 TOOLS 注册表始终一致。
-        """
+        """从 prompt_dir 加载系统提示词；文件缺失时回退默认提示词。"""
         prompt_file = Path(self.agent_params.prompt_dir) / "tools_system_prompt.md"
         try:
-            text = prompt_file.read_text(encoding="utf-8")
+            return prompt_file.read_text(encoding="utf-8")
         except OSError:
             return DEFAULT_SYSTEM_PROMPT
-        return text.replace("{tool_list}", render_tool_section())
 
     def run(self, request: AgentRequest) -> AgentResponse:
         """执行一次任务请求，返回最终结果与逐步轨迹。
 
         每轮流程：
 
-        1. ``llm.complete(messages)`` 得到原始输出；
-        2. ``parse_action`` 解析为 Action：
-           - FinalAnswer → 正常返回；
-           - ToolCall → 通过注入的 tools 执行（未注入则回灌错误观察）；
-           - Retry → 把原因作为观察回灌给模型继续；
-        3. 超过 max_turns → 以 MAX_TURNS 收口；
-        4. LLM 异常 → 以 ERROR 收口。
+        1. ``llm.complete(messages, tools=...)`` 得到结构化返回；
+        2. 有 ``tool_calls`` → 循环执行全部（并行，审批用 request_batch），
+           观察结果以 role=tool 回灌，进入下一轮；
+        3. 无 ``tool_calls`` → ``text`` 即最终答案，正常返回；
+        4. 超过 max_turns → 以 MAX_TURNS 收口；
+        5. LLM 异常 → 以 ERROR 收口。
         """
         max_turns = (
             request.max_turns
@@ -202,6 +184,7 @@ class AgentLoop:
             try:
                 result: LLMResponse = self.llm.complete(
                     messages,
+                    tools=to_openai_tools(),
                     max_new_tokens=self.agent_params.max_output_tokens,
                 )
             except Exception as exc:
@@ -214,60 +197,43 @@ class AgentLoop:
                     error=str(exc),
                 )
 
-            raw_output = result.text
-            action = parse_action(raw_output)
-
-            if isinstance(action, FinalAnswer):
+            if not result.tool_calls:
+                # 无工具调用 = 本轮即最终答案。
                 steps.append(
                     StepRecord(
                         turn=turn,
-                        raw_output=raw_output,
-                        action=action,
+                        raw_output=result.text,
+                        final_answer=result.text,
                         assistant_metadata=result.metadata,
                     )
                 )
                 return AgentResponse(
-                    final_answer=action.text,
+                    final_answer=result.text,
                     stop_reason=StopReason.FINAL_ANSWER,
                     turns_used=turn,
                     tool_calls=tool_calls,
                     steps=steps,
                 )
 
-            if isinstance(action, ToolCall):
-                # 审批闸门：工具调用前询问用户，拒绝则不执行、不计调用次数。
-                if self.approval_gate is not None and not self.approval_gate.request(
-                    action.name, action.args
-                ):
-                    observation = (
-                        f"错误：用户拒绝了工具调用 {action.name!r}；"
-                        "请改用其他方式或直接给出最终答案。"
-                    )
-                else:
-                    observation = self._execute_tool(action)
-                    if self.tools is not None:
-                        tool_calls += 1
-                step = StepRecord(
-                    turn=turn,
-                    raw_output=raw_output,
-                    action=action,
-                    observation=observation,
-                    assistant_metadata=result.metadata,
-                )
-                steps.append(step)
-                messages.extend(step_to_messages(step))
-                continue
+            # 工具轮：并行执行全部调用（审批用批量闸门）。
+            calls: list[tuple[str, dict]] = []
+            for call in result.tool_calls:
+                function = (call or {}).get("function") or {}
+                name = function.get("name")
+                try:
+                    args = json.loads(function.get("arguments") or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                calls.append((name, args))
 
-            # Retry：把原因作为 user 反馈回灌，模型重试，不消耗工具计数。
-            reason = action.reason or "输出不符合契约"
-            observation = (
-                f"输出不符合契约，请重新输出合法 JSON。原因：{reason}"
-            )
+            observations, executed = self._execute_tool_batch(calls)
+            tool_calls += executed
+
             step = StepRecord(
                 turn=turn,
-                raw_output=raw_output,
-                action=action,
-                observation=observation,
+                raw_output=result.text,
+                tool_calls=list(result.tool_calls),
+                observations=observations,
                 assistant_metadata=result.metadata,
             )
             steps.append(step)
@@ -282,14 +248,34 @@ class AgentLoop:
             steps=steps,
         )
 
-    def _execute_tool(self, call: ToolCall) -> str:
-        """执行一次工具调用并返回观察结果字符串；任何失败都转成错误文本。"""
+    def _execute_tool_batch(self, calls: list[tuple[str, dict]]) -> tuple[list[str], int]:
+        """并行执行一批工具调用，返回 (观察结果列表, 实际执行数)。
+
+        审批闸门存在时整批询问一次，拒绝则整批不执行、不计执行数；
+        任何失败都转成错误文本观察。
+        """
         if self.tools is None:
+            prefix = "错误：当前未启用工具，无法调用"
             return (
-                f"错误：当前未启用工具，无法调用 {call.name!r}；"
-                "请直接给出最终答案。"
+                [f"{prefix} {name!r}；请直接给出最终答案。" for name, _ in calls],
+                0,
             )
-        try:
-            return str(self.tools.execute(call.name, call.args))
-        except Exception as exc:
-            return f"错误：工具 {call.name} 执行失败：{exc}"
+
+        if self.approval_gate is not None and not self.approval_gate.request_batch(
+            calls
+        ):
+            return (
+                [
+                    "错误：用户拒绝了这批工具调用；请改用其他方式或直接给出最终答案。"
+                    for _ in calls
+                ],
+                0,
+            )
+
+        observations = []
+        for name, args in calls:
+            try:
+                observations.append(str(self.tools.execute(name, args)))
+            except Exception as exc:
+                observations.append(f"错误：工具 {name} 执行失败：{exc}")
+        return observations, len(calls)

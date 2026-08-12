@@ -15,9 +15,14 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from myagent.actions import FinalAnswer, Retry, ToolCall
 from myagent.agent_config import Message
-from myagent.contracts import AgentRequest, AgentResponse, StepRecord, StopReason
+from myagent.agent_loop import step_to_messages
+from myagent.contracts import (
+    AgentRequest,
+    AgentResponse,
+    StepRecord,
+    StopReason,
+)
 from myagent.cli import _print_response, _repl, _trim_history
 
 
@@ -91,13 +96,18 @@ class CliReplTest(unittest.TestCase):
     def test_history_carried_to_next_turn(self):
         step = StepRecord(
             turn=1,
-            raw_output='{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-            action=ToolCall(
-                name="read_file",
-                args={"path": "a.py"},
-                raw='{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-            ),
-            observation="观察结果",
+            raw_output="",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path": "a.py"}',
+                    },
+                }
+            ],
+            observations=["观察结果"],
             assistant_metadata={"reasoning_content": "思考过程"},
         )
         loop = FakeLoop([final_response("第一轮完成", [step]), final_response("第二轮完成")])
@@ -125,14 +135,14 @@ class CliReplTest(unittest.TestCase):
         self.assertEqual(history[1].metadata, {"reasoning_content": "思考过程"})
 
     def test_retry_step_rebuilt_as_user_feedback(self):
-        retry_step = StepRecord(
+        # 纯文本 assistant 轮（非工具轮）在历史里只重建一条 assistant 消息。
+        plain_step = StepRecord(
             turn=1,
-            raw_output="不是 JSON",
-            action=Retry(reason="不是合法 JSON"),
-            observation="输出不符合契约，请重新输出合法 JSON。原因：不是合法 JSON",
+            raw_output="中间说明",
+            final_answer=None,
         )
         loop = FakeLoop(
-            [final_response("第一轮完成", [retry_step]), final_response("第二轮完成")]
+            [final_response("第一轮完成", [plain_step]), final_response("第二轮完成")]
         )
         with mock.patch("builtins.input", side_effect=["任务", "继续", "/exit"]):
             code = _repl(loop)
@@ -140,10 +150,11 @@ class CliReplTest(unittest.TestCase):
 
         history = loop.requests[1].messages
         roles = [m.role for m in history]
-        # Retry 反馈不伪造工具调用，以 user 角色回灌。
-        self.assertEqual(roles, ["user", "assistant", "user"])
-        self.assertEqual(history[2].content, retry_step.observation)
-        self.assertIsNone(history[2].tool_call_id)
+        # 纯文本 assistant 轮只有一条 assistant 消息，无 tool 配对。
+        self.assertEqual(roles, ["user", "assistant"])
+        self.assertEqual(history[1].content, "中间说明")
+        self.assertIsNone(history[1].tool_call_id)
+        self.assertEqual(history[1].tool_calls, [])
 
     def test_print_response_exit_codes(self):
         self.assertEqual(_print_response(final_response("好")), 0)
@@ -174,14 +185,6 @@ class CliReplTest(unittest.TestCase):
 
 class TrimHistoryTest(unittest.TestCase):
     """_trim_history 配对安全裁剪。"""
-
-    def _assistant_call(self, call_id: str) -> StepRecord:
-        return StepRecord(
-            turn=1,
-            raw_output=f'{{"action": "tool_call", "tool": "read_file"}}',
-            action=ToolCall(name="read_file", args={}, raw=""),
-            observation="内容",
-        )
 
     def test_within_limit_unchanged(self):
         history = [Message(role="user", content="a"), Message(role="assistant", content="b")]

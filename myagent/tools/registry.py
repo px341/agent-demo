@@ -47,6 +47,45 @@ TOOLS: dict[str, ToolSpec] = {}
 RISK_LEVELS = ("read", "write", "delete")
 
 
+def to_openai_tools() -> list[dict[str, Any]]:
+    """把注册表渲染为 OpenAI 原生 tools 数组（供 LLMClient.complete 传入）。
+
+    ToolSpec.parameters 是参数 schema 字典（键为参数名，值为各参数的
+    JSON Schema 片段）。OpenAI 端点要求 function.parameters 是合法的
+    JSON Schema 对象（顶层 ``type: object``），因此这里包装成
+    ``{"type": "object", "properties": {...}}``，并把参数级
+    ``required: true`` 汇总到顶层 ``required``（OpenAI 不允许在属性内
+    出现 required 键）。
+    """
+    tools: list[dict[str, Any]] = []
+    for spec in TOOLS.values():
+        raw = spec.parameters or {}
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+        for name, schema in raw.items():
+            prop = dict(schema)
+            # OpenAI 属性级 schema 不支持 required / default 键，剥离。
+            prop.pop("required", None)
+            prop.pop("default", None)
+            if schema.get("required"):
+                required.append(name)
+            properties[name] = prop
+        parameters: dict[str, Any] = {"type": "object", "properties": properties}
+        if required:
+            parameters["required"] = required
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": parameters,
+                },
+            }
+        )
+    return tools
+
+
 def register_tool(
     name: str,
     description: str = "",

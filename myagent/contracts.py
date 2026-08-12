@@ -6,8 +6,10 @@
 - 返回值契约：AgentResponse / StepRecord / StopReason —— 一次请求的最终结果；
 - 依赖接口：LLMClient（必需）、ToolExecutor / MemoryStore / ContextComposer（可选注入）。
 
-工具执行、记忆、上下文压缩的具体实现分别放入 tools 包 / memory 包 /
-context 包，只要满足对应 Protocol 即可接入，主循环代码无需改动。
+模型输出走 OpenAI 原生 tool_calls 协议（tool_calls 数组 + 文本内容），
+不再使用自定义 JSON 契约（已移除）。工具执行、记忆、上下文压缩的
+具体实现分别放入 tools 包 / memory 包 / context 包，只要满足对应
+Protocol 即可接入，主循环代码无需改动。
 """
 from __future__ import annotations
 
@@ -15,23 +17,25 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
-from .actions import Action
 from .agent_config import Message
 
 
 class LLMClient(Protocol):
     """模型推理接口（唯一必需依赖）。
 
-    ``complete()`` 接收完整消息列表，返回结构化 ``LLMResponse``：
-    文本交给主循环用 ``actions.parse_action`` 解析；
-    metadata（如 DeepSeek thinking mode 的 reasoning_content）
-    由主循环随 assistant 消息回传，保证多轮调用合法。
+    ``complete()`` 接收完整消息列表与工具描述（OpenAI 格式），返回结构化
+    ``LLMResponse``：
+    - 有 ``tool_calls`` → 模型请求调用工具（主循环执行后回灌）；
+    - 无 ``tool_calls`` → ``text`` 即最终答案。
+    metadata（如 DeepSeek thinking mode 的 reasoning_content）由主循环
+    随 assistant 消息回传，保证多轮调用合法。
     """
 
     def complete(
         self,
         messages: list[Message],
         *,
+        tools: list[dict[str, Any]] | None = None,
         max_new_tokens: int | None = None,
     ) -> LLMResponse: ...
 
@@ -40,13 +44,16 @@ class LLMClient(Protocol):
 class LLMResponse:
     """模型一次调用的结构化返回。
 
-    - ``text``：模型输出文本（主循环用于解析 Action）；
+    - ``text``：模型输出的文本内容（无 tool_calls 时为最终答案）；
+    - ``tool_calls``：OpenAI 原生工具调用数组
+      ``[{"id", "type", "function": {"name", "arguments"}}]``；空表示未调用工具；
     - ``metadata``：需要随 assistant 消息原样回传的附加字段
       （如 DeepSeek thinking mode 的 ``reasoning_content``），
       缺失会导致真实端点 400。
     """
 
     text: str
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -118,16 +125,23 @@ class ContextComposer(Protocol):
         user_input: str,
     ) -> list[Message]: ...
 
+    def recompress(
+        self, messages: list[Message], user_input: str | None = None
+    ) -> list[Message]: ...
+
 
 class ApprovalGate(Protocol):
     """工具调用审批闸门（可选依赖；None 表示不审批、直接执行）。
 
-    主循环在执行每个工具前调用 ``request``：
+    主循环在**每轮**执行工具前调用 ``request`` / ``request_batch``：
     - 返回 True  → 允许执行；
     - 返回 False → 拒绝执行，观察文本提示用户拒绝，模型继续推理。
     """
 
     def request(self, name: str, args: dict[str, Any]) -> bool: ...
+
+    def request_batch(self, calls: list[tuple[str, dict[str, Any]]]) -> bool:
+        """一次性审批多个工具调用（并行）；返回是否全部允许。"""
 
 
 @dataclass(slots=True)
@@ -151,10 +165,10 @@ class AgentRequest:
 class StopReason(str, Enum):
     """主循环结束原因。"""
 
-    #: 模型给出最终答案，正常收口。
+    #: 模型给出最终答案（无 tool_calls 轮），正常收口。
     FINAL_ANSWER = "final_answer"
 
-    #: 达到轮数上限（模型始终未给出 final）。
+    #: 达到轮数上限（模型始终未给出最终答案）。
     MAX_TURNS = "max_turns"
 
     #: LLM 调用抛出异常。
@@ -163,7 +177,7 @@ class StopReason(str, Enum):
 
 @dataclass(slots=True)
 class StepRecord:
-    """ReAct 一步的完整轨迹：模型原始输出、解析后的 Action、观察结果。
+    """ReAct 一步的完整轨迹：模型原始输出、工具调用、观察结果。
 
     供日志 / 调试 / 审计使用，不参与模型推理。
     """
@@ -171,14 +185,17 @@ class StepRecord:
     #: 从 1 开始的推理轮数。
     turn: int
 
-    #: 模型原始输出文本。
+    #: 模型原始输出文本（无 tool_calls 时为最终答案，即 raw_text）。
     raw_output: str
 
-    #: 解析后的 Action（ToolCall / FinalAnswer / Retry）。
-    action: Action
+    #: 本轮模型请求的工具调用（OpenAI 原生结构）；空表示本轮即最终答案。
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    #: 工具执行结果或错误提示；tool_call / retry 轮次为非 None。
-    observation: str | None = None
+    #: 无 tool_calls 时的最终答案文本；None 表示本轮调用了工具。
+    final_answer: str | None = None
+
+    #: 工具执行结果文本列表（与 tool_calls 一一对应）；无工具轮为空。
+    observations: list[str] = field(default_factory=list)
 
     #: 本轮 assistant 消息的附加元数据（如 reasoning_content），
     #: 历史重建时随 assistant 消息回传。

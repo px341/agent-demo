@@ -29,7 +29,7 @@ class FakeLLM:
         self.output = output
         self.calls: list = []
 
-    def complete(self, messages, *, max_new_tokens=None):
+    def complete(self, messages, *, tools=None, max_new_tokens=None):
         self.calls.append(list(messages))
         return LLMResponse(text=self.output)
 
@@ -144,10 +144,12 @@ class AgentLoopEnvTest(unittest.TestCase):
         self.assertIn("myagent/", system.content)
         # 文件树不含 .venv 目录（忽略列表仅出现在说明文字中，目录带 / 后缀）。
         self.assertNotIn(".venv/", system.content)
-        # 工具 prompt 拼接在环境 prompt 之后；工具段为注册表动态渲染。
-        self.assertIn("## 五、可用工具", system.content)
-        self.assertIn("### delete_dir", system.content)
+        # 工具 prompt 拼接在环境 prompt 之后；工具列表由 function calling
+        # 协议提供（不再嵌进 prompt）。
+        self.assertIn("## 五、规则", system.content)
+        self.assertIn("## 二、工具使用方式", system.content)
         self.assertNotIn("{tool_list}", system.content)
+        self.assertNotIn("### delete_dir", system.content)
 
     def test_environment_regenerated_each_run(self):
         """每次 run 重新生成系统提示（时间戳逐次刷新，内容有效）。"""

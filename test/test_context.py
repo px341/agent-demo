@@ -18,7 +18,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from myagent.actions import FinalAnswer
 from myagent.agent_config import AgentParams, Message
 from myagent.agent_loop import AgentLoop
 from myagent.context import ContextComposer
@@ -300,27 +299,18 @@ class ComposeIntegrationTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def _step_tool(self):
-        raw = '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}'
-        return StepRecord(
-            turn=1,
-            raw_output=raw,
-            action=FinalAnswer(text="x"),  # 只用于 step_to_messages 结构
-            observation=None,
-        )
-
     def _fake_llm(self, outputs):
         class Fake:
             calls = []
 
-            def complete(self, messages, *, max_new_tokens=None):
+            def complete(self, messages, *, tools=None, max_new_tokens=None):
                 self.calls.append(list(messages))
                 return LLMResponse(text=outputs.pop(0))
 
         return Fake()
 
     def test_loop_with_composer_compresses(self):
-        llm = self._fake_llm(['{"action": "final", "answer": "ok"}'])
+        llm = self._fake_llm(["ok"])
         params = AgentParams(cwd=str(self.tmp.name), max_input_tokens=200, max_output_tokens=50)
         composer = ContextComposer(
             max_input_tokens=params.max_input_tokens,
@@ -335,7 +325,7 @@ class ComposeIntegrationTest(unittest.TestCase):
         self.assertEqual(msgs[-1].content, "u")
 
     def test_loop_without_composer_unchanged(self):
-        llm = self._fake_llm(['{"action": "final", "answer": "ok"}'])
+        llm = self._fake_llm(["ok"])
         params = AgentParams(cwd=str(self.tmp.name))
         loop = AgentLoop(params, llm=llm)
         loop.run(AgentRequest(user_input="u"))
@@ -344,7 +334,7 @@ class ComposeIntegrationTest(unittest.TestCase):
 
     def test_loop_with_composer_default_params_zero_change(self):
         # 默认参数 + 小历史：composer 预算充足 → 消息与不注入时一致。
-        llm = self._fake_llm(['{"action": "final", "answer": "ok"}'])
+        llm = self._fake_llm(["ok"])
         params = AgentParams(cwd=str(self.tmp.name))
         composer = ContextComposer(
             max_input_tokens=params.max_input_tokens,
@@ -628,18 +618,27 @@ class InTurnComposeTest(unittest.TestCase):
             self.outputs = list(outputs)
             self.calls = []  # 每次 complete 收到的 messages 快照
 
-        def complete(self, messages, *, max_new_tokens=None):
+        def complete(self, messages, *, tools=None, max_new_tokens=None):
             self.calls.append(list(messages))
-            return LLMResponse(text=self.outputs.pop(0))
+            return self.outputs.pop(0)
+
+    def _tool_resp(self, name: str, call_id: str) -> LLMResponse:
+        return LLMResponse(
+            text="",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": '{"path": "x"}'},
+                }
+            ],
+        )
 
     def test_later_turn_tool_result_is_clipped(self):
         # 回归：第二轮发给 LLM 的 tool 结果必须被裁剪（此前被绕过）。
         tools = self._FakeTools("X" * 5000)
         llm = self._FakeLLM(
-            [
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-                '{"action": "final", "answer": "ok"}',
-            ]
+            [self._tool_resp("read_file", "call_1"), LLMResponse(text="ok")]
         )
         params = AgentParams(cwd=str(self.tmp.name), max_turns=3)
         loop = AgentLoop(
@@ -659,10 +658,7 @@ class InTurnComposeTest(unittest.TestCase):
         # 多轮会话中，当前用户输入（被 tool 对顶到中间）始终保留。
         tools = self._FakeTools("小结果")
         llm = self._FakeLLM(
-            [
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-                '{"action": "final", "answer": "ok"}',
-            ]
+            [self._tool_resp("read_file", "call_1"), LLMResponse(text="ok")]
         )
         params = AgentParams(cwd=str(self.tmp.name), max_turns=3)
         loop = AgentLoop(params, llm=llm, tools=tools, composer=self._make(max_input=3000))
@@ -676,10 +672,10 @@ class InTurnComposeTest(unittest.TestCase):
         tools = self._FakeTools("数据" * 200)  # 每条约 200 token
         llm = self._FakeLLM(
             [
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "b.py"}}',
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "c.py"}}',
-                '{"action": "final", "answer": "done"}',
+                self._tool_resp("read_file", "call_1"),
+                self._tool_resp("read_file", "call_2"),
+                self._tool_resp("read_file", "call_3"),
+                LLMResponse(text="done"),
             ]
         )
         params = AgentParams(cwd=str(self.tmp.name), max_turns=5)
@@ -706,10 +702,7 @@ class InTurnComposeTest(unittest.TestCase):
     def test_recompress_disabled_when_composer_none(self):
         tools = self._FakeTools("X" * 5000)
         llm = self._FakeLLM(
-            [
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-                '{"action": "final", "answer": "ok"}',
-            ]
+            [self._tool_resp("read_file", "call_1"), LLMResponse(text="ok")]
         )
         params = AgentParams(cwd=str(self.tmp.name), max_turns=3)
         loop = AgentLoop(params, llm=llm, tools=tools, composer=None)

@@ -48,13 +48,17 @@ class OpenAICompatibleModelClient:
         self,
         messages: list[Message],
         *,
+        tools: list[dict] | None = None,
         max_new_tokens: int | None = None,
     ) -> LLMResponse:
-        """主循环的模型推理接口：完整消息列表 → 结构化返回（文本 + 元数据）。
+        """主循环的模型推理接口：完整消息列表 → 结构化返回（文本 + 工具调用）。
 
         使用 OpenAI SDK 的 chat.completions（OpenAI 兼容端点通用格式），
         消息结构与主循环的 Message 契约一一对应：
         system / user / assistant 消息原样透传，tool 消息附带 tool_call_id。
+
+        ``tools`` 为 OpenAI 原生 tools 数组（由注册表 to_openai_tools 生成）；
+        DeepSeek 原生支持 tool_calls 输出（含一次多个并行调用）。
 
         DeepSeek thinking mode 下 assistant 响应带 ``reasoning_content``，
         后续请求必须原样回传，否则端点 400；因此这里提取进 metadata，
@@ -73,13 +77,17 @@ class OpenAICompatibleModelClient:
                     item["reasoning_content"] = reasoning
             payload.append(item)
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=payload,
-            stream=False,
-            max_tokens=max_new_tokens or self.agent_params.max_output_tokens,
-            temperature=0.2,
-        )
+        kwargs: dict = {
+            "model": self.model,
+            "messages": payload,
+            "stream": False,
+            "max_tokens": max_new_tokens or self.agent_params.max_output_tokens,
+            "temperature": 0.2,
+        }
+        if tools:
+            kwargs["tools"] = tools
+
+        response = self.client.chat.completions.create(**kwargs)
 
         message = response.choices[0].message
         text = message.content or ""
@@ -89,4 +97,18 @@ class OpenAICompatibleModelClient:
         if reasoning is None and hasattr(message, "model_extra"):
             reasoning = (message.model_extra or {}).get("reasoning_content")
         metadata = {"reasoning_content": reasoning} if reasoning else {}
-        return LLMResponse(text=text, metadata=metadata)
+
+        tool_calls = []
+        if getattr(message, "tool_calls", None):
+            tool_calls = [
+                {
+                    "id": call.id,
+                    "type": call.type,
+                    "function": {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    },
+                }
+                for call in message.tool_calls
+            ]
+        return LLMResponse(text=text, tool_calls=tool_calls, metadata=metadata)

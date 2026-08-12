@@ -18,7 +18,6 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from myagent.actions import FinalAnswer, ToolCall
 from myagent.agent_config import AgentParams, Message
 from myagent.agent_loop import AgentLoop
 from myagent.cli import _archive_steps, _repl, _sweep_memory
@@ -59,7 +58,7 @@ class FakeLLM:
         self.outputs = list(outputs or [])
         self.calls: list[list[Message]] = []
 
-    def complete(self, messages, *, max_new_tokens=None):
+    def complete(self, messages, *, tools=None, max_new_tokens=None):
         self.calls.append(list(messages))
         if self.outputs:
             return LLMResponse(text=self.outputs.pop(0))
@@ -395,7 +394,7 @@ class SweepStateMachineTest(unittest.TestCase):
 
     def test_failed_retry_increments_on_real_exception(self):
         class Boom:
-            def complete(self, messages, *, max_new_tokens=None):
+            def complete(self, messages, *, tools=None, max_new_tokens=None):
                 raise RuntimeError("API boom")
 
         mgr = self._ready_manager(llm=Boom())
@@ -407,7 +406,7 @@ class SweepStateMachineTest(unittest.TestCase):
 
     def test_retry_chain_gives_up_after_three(self):
         class Boom:
-            def complete(self, messages, *, max_new_tokens=None):
+            def complete(self, messages, *, tools=None, max_new_tokens=None):
                 raise RuntimeError("API boom")
 
         mgr = make_manager(self.tmp, llm=Boom(), idle_threshold=0)
@@ -556,7 +555,7 @@ class AgentLoopMemoryTest(unittest.TestCase):
         (self.tmp / "memories").mkdir(parents=True, exist_ok=True)
         (self.tmp / "memories" / "summary.md").write_text("记忆内容", encoding="utf-8")
         mgr = make_manager(self.tmp)
-        llm = FakeLLM(['{"action": "final", "answer": "ok"}'])
+        llm = FakeLLM(["ok"])
         loop = self._loop_with_memory(llm, mgr)
         loop.run(AgentRequest(user_input="hi"))
         system = llm.calls[0][0].content
@@ -564,7 +563,7 @@ class AgentLoopMemoryTest(unittest.TestCase):
         self.assertIn("记忆内容", system)
 
     def test_loop_without_memory_unchanged(self):
-        llm = FakeLLM(['{"action": "final", "answer": "ok"}'])
+        llm = FakeLLM(["ok"])
         loop = AgentLoop(AgentParams(cwd=str(self.tmp)), llm=llm)
         loop.run(AgentRequest(user_input="hi"))
         system = llm.calls[0][0].content
@@ -574,7 +573,7 @@ class AgentLoopMemoryTest(unittest.TestCase):
         (self.tmp / "memories").mkdir(parents=True, exist_ok=True)
         (self.tmp / "memories" / "summary.md").write_text("记忆内容", encoding="utf-8")
         mgr = make_manager(self.tmp)
-        llm = FakeLLM(['{"action": "final", "answer": "ok"}'])
+        llm = FakeLLM(["ok"])
         loop = self._loop_with_memory(llm, mgr)
         loop.run(AgentRequest(user_input="hi"))
         system = llm.calls[0][0].content
@@ -585,7 +584,7 @@ class AgentLoopMemoryTest(unittest.TestCase):
     def test_empty_memory_block_not_injected(self):
         # 有 memory 但 summary.md 为空 → 不注入记忆段（环境段正常）。
         mgr = make_manager(self.tmp)
-        llm = FakeLLM(['{"action": "final", "answer": "ok"}'])
+        llm = FakeLLM(["ok"])
         loop = self._loop_with_memory(llm, mgr)
         loop.run(AgentRequest(user_input="hi"))
         system = llm.calls[0][0].content
@@ -634,7 +633,7 @@ class SummarizerDirectTest(unittest.TestCase):
 
     def test_aggregate_llm_exception_raises(self):
         class Boom:
-            def complete(self, messages, *, max_new_tokens=None):
+            def complete(self, messages, *, tools=None, max_new_tokens=None):
                 raise RuntimeError("网络挂了")
 
         summarizer = Summarizer(Boom(), self.prompts)
@@ -643,7 +642,7 @@ class SummarizerDirectTest(unittest.TestCase):
 
     def test_extract_llm_exception_raises(self):
         class Boom:
-            def complete(self, messages, *, max_new_tokens=None):
+            def complete(self, messages, *, tools=None, max_new_tokens=None):
                 raise RuntimeError("网络挂了")
 
         summarizer = Summarizer(Boom(), self.prompts)
@@ -699,8 +698,8 @@ class CliMemoryTest(unittest.TestCase):
     def test_repl_archives_messages_and_closes_on_exit(self):
         step = StepRecord(
             turn=1,
-            raw_output='{"action": "final", "answer": "好"}',
-            action=FinalAnswer(text="好"),
+            raw_output="好",
+            final_answer="好",
         )
         loop = FakeLoop([final_response("好", [step])])
         memory = FakeMemory()
@@ -722,12 +721,20 @@ class CliMemoryTest(unittest.TestCase):
 
     def test_archive_steps_appends_tool_pair(self):
         memory = FakeMemory()
-        raw = '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}'
         step = StepRecord(
             turn=1,
-            raw_output=raw,
-            action=ToolCall(name="read_file", args={"path": "a.py"}, raw=raw),
-            observation="内容",
+            raw_output="",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path": "a.py"}',
+                    },
+                }
+            ],
+            observations=["内容"],
         )
         _archive_steps(memory, final_response(steps=[step]))
         self.assertEqual([m.role for m in memory.appended], ["assistant", "tool"])

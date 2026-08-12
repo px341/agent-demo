@@ -74,6 +74,36 @@ class ConsoleApprovalGateTest(unittest.TestCase):
         with mock.patch("builtins.input", return_value="y"):
             self.assertTrue(gate.request("read_file", {}))
 
+    def test_batch_all_read_auto_approved(self):
+        """整批 read 工具免询问直接放行。"""
+        calls = [("read_file", {"path": "a"}), ("list_files", {"path": "."})]
+        with mock.patch("builtins.input") as mocked:
+            self.assertTrue(ConsoleApprovalGate().request_batch(calls))
+        mocked.assert_not_called()
+
+    def test_batch_with_write_asks_once(self):
+        """批内含 write 工具 → 一次性列出全部调用询问。"""
+        calls = [
+            ("read_file", {"path": "a"}),
+            ("write_file", {"path": "b", "content": "c"}),
+        ]
+        with mock.patch("builtins.input", return_value="y") as mocked:
+            self.assertTrue(ConsoleApprovalGate().request_batch(calls))
+        prompt = mocked.call_args[0][0]
+        # 两个调用都在同一 prompt 里。
+        self.assertIn("read_file", prompt)
+        self.assertIn("write_file", prompt)
+
+    def test_batch_deny(self):
+        calls = [("write_file", {"path": "b"}), ("delete_file", {"path": "c"})]
+        with mock.patch("builtins.input", return_value="n"):
+            self.assertFalse(ConsoleApprovalGate().request_batch(calls))
+
+    def test_batch_eof_denies(self):
+        calls = [("write_file", {"path": "b"})]
+        with mock.patch("builtins.input", side_effect=EOFError):
+            self.assertFalse(ConsoleApprovalGate().request_batch(calls))
+
 
 if __name__ == "__main__":
     unittest.main()

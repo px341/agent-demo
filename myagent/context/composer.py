@@ -8,15 +8,16 @@
   - **tool 独立预算（无条件执行，与整体预算正交）**：
     1. 单条 tool 输出超 ``max_tool_tokens`` → 裁剪为开头+结尾各半（保留原文，
        只动 content 字符串，不改 assistant 的 tool_calls 声明与配对）；
-    2. tool 总 token 超 ``max_total_tool_tokens`` → 从最早 tool 对整对丢弃，
-       保留最新一对；
+    2. tool 总 token 超 ``max_total_tool_tokens`` → 从最早工具组整组丢弃，
+       保留最新一组；
   - **整体预算不足时**：
-    3. 从最早非 tool 消息丢弃（user 输入 / assistant 纯文本 / retry 反馈），
+    3. 从最早非 tool 消息丢弃（user 输入 / assistant 纯文本 / 反馈），
        保护带 tool_calls 的 assistant；
-    4. 兜底：非 tool 删光仍超 → 才丢最早 tool 对。
+    4. 兜底：非 tool 删光仍超 → 才丢最早工具组。
 
-约束：丢弃单元是 (assistant tool_calls 声明, 配对 tool 结果) 成对，绝不留下
-孤儿 tool 消息或孤儿 tool_calls 声明；消息相对顺序保持不变；不修改入参。
+约束：丢弃单元是工具组（assistant 声明 + 其全部配对 tool 结果，原生 FC 下
+一个 assistant 可带多个 tool_calls），绝不留下孤儿 tool 消息或孤儿
+tool_calls 声明；消息相对顺序保持不变；不修改入参。
 """
 from __future__ import annotations
 
@@ -169,20 +170,19 @@ class ContextComposer:
                     metadata=dict(m.metadata),
                 )
 
-        # 阶段 2：tool 总量超限 → 从最早 tool 对整对丢弃，保留最新一对。
+        # 阶段 2：tool 总量超限 → 从最早工具组整组丢弃，保留最新一组。
         while True:
-            pairs = self._collect_tool_pairs(msgs)
-            if len(pairs) <= 1:
-                break  # 最新一对（或没有）永不因总量被丢
+            groups = self._collect_tool_pairs(msgs)
+            if len(groups) <= 1:
+                break  # 最新一组（或没有）永不因总量被丢
             tool_total = sum(
-                count_message_tokens(msgs[a]) + count_message_tokens(msgs[t])
-                for a, t in pairs
+                count_message_tokens(msgs[i]) for group in groups for i in group
             )
             if tool_total <= self.max_total_tool_tokens:
                 break
-            a, t = pairs[0]
-            del msgs[t]
-            del msgs[a]
+            # 删除最早一组（索引降序，避免位移）。
+            for i in sorted(groups[0], reverse=True):
+                del msgs[i]
 
         total = sum(count_message_tokens(m) for m in msgs)
         if total <= budget:
@@ -199,14 +199,13 @@ class ContextComposer:
         if total <= budget:
             return msgs
 
-        # 阶段 4：兜底 —— 非 tool 删光仍超，才丢最早 tool 对（同样保最新一对）。
+        # 阶段 4：兜底 —— 非 tool 删光仍超，才丢最早工具组（同样保最新一组）。
         while total > budget:
-            pairs = self._collect_tool_pairs(msgs)
-            if len(pairs) <= 1:
+            groups = self._collect_tool_pairs(msgs)
+            if len(groups) <= 1:
                 break
-            a, t = pairs[0]
-            del msgs[t]
-            del msgs[a]
+            for i in sorted(groups[0], reverse=True):
+                del msgs[i]
             total = sum(count_message_tokens(m) for m in msgs)
         return msgs
 
@@ -229,27 +228,26 @@ class ContextComposer:
             return i
         return None
 
-    def _collect_tool_pairs(self, msgs: list[Message]) -> list[tuple[int, int]]:
-        """按出现顺序收集 (assistant tool_calls 声明索引, 配对 tool 结果索引)。
+    def _collect_tool_pairs(self, msgs: list[Message]) -> list[list[int]]:
+        """按出现顺序收集工具调用组：每个组 = [assistant 声明, *配对 tool 结果]。
 
-        配对规则：assistant 的 tool_calls[0].id 与后续第一个 role=tool 消息的
-        tool_call_id 匹配；找不到匹配时退化为后续第一个 role=tool 消息。
+        一个 assistant 可带多个 tool_calls（原生 FC 并行），其全部结果
+        同属一组；配对按 tool_call_id 匹配，只收连续跟随的 role=tool 消息。
         """
-        pairs: list[tuple[int, int]] = []
+        groups: list[list[int]] = []
         i = 0
         while i < len(msgs):
             m = msgs[i]
             if m.role == "assistant" and m.tool_calls:
-                call_id = (m.tool_calls[0] or {}).get("id")
-                for j in range(i + 1, len(msgs)):
-                    if msgs[j].role != "tool":
-                        continue
-                    if call_id is None or msgs[j].tool_call_id == call_id:
-                        pairs.append((i, j))
-                        i = j + 1
-                        break
-                else:
-                    i += 1
+                call_ids = {(call or {}).get("id") for call in m.tool_calls}
+                group = [i]
+                j = i + 1
+                while j < len(msgs) and msgs[j].role == "tool":
+                    if msgs[j].tool_call_id in call_ids:
+                        group.append(j)
+                    j += 1
+                groups.append(group)
+                i = j
                 continue
             i += 1
-        return pairs
+        return groups

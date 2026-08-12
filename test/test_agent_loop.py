@@ -1,20 +1,33 @@
-"""AgentLoop 主循环的契约测试。
+"""AgentLoop 主循环的契约测试（OpenAI 原生 tool_calls 协议）。
 
 不依赖真实 LLM：注入 FakeLLM / FakeTools 验证主循环各分支
-（final / tool_call / retry / max_turns / 无工具 / LLM 异常 / 历史保留）。
+（final / 单工具 / 并行多工具 / 无工具 / 审批 / max_turns / LLM 异常 /
+历史保留 / reasoning_content 透传）。
 """
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from myagent.actions import FinalAnswer, Retry, ToolCall
 from myagent.agent_config import AgentParams, Message
 from myagent.agent_loop import AgentLoop, step_to_messages
-from myagent.contracts import AgentRequest, LLMResponse, StopReason
+from myagent.contracts import AgentRequest, AgentResponse, LLMResponse, StopReason
+
+
+def tc(name: str, args: dict, call_id: str = "call_1") -> dict:
+    """构造 OpenAI 原生 tool_calls 单条。"""
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(args, ensure_ascii=False),
+        },
+    }
 
 
 class FakeLLM:
@@ -26,14 +39,14 @@ class FakeLLM:
     def __init__(self, outputs: list[str | LLMResponse], fallback: str | LLMResponse | None = None):
         self.outputs = list(outputs)
         self.fallback = fallback
-        self.calls: list[tuple[list[Message], int | None]] = []
+        self.calls: list[tuple[list[Message], list[dict], int | None]] = []
 
     @staticmethod
     def _wrap(output: str | LLMResponse) -> LLMResponse:
         return output if isinstance(output, LLMResponse) else LLMResponse(text=output)
 
-    def complete(self, messages, *, max_new_tokens=None):
-        self.calls.append((list(messages), max_new_tokens))
+    def complete(self, messages, *, tools=None, max_new_tokens=None):
+        self.calls.append((list(messages), list(tools or []), max_new_tokens))
         if self.outputs:
             return self._wrap(self.outputs.pop(0))
         if self.fallback is not None:
@@ -70,7 +83,7 @@ def make_loop(
 
 class AgentLoopTest(unittest.TestCase):
     def test_final_answer_direct(self):
-        llm = FakeLLM(['{"action": "final", "answer": "42"}'])
+        llm = FakeLLM(["42"])
         loop = make_loop(llm)
         resp = loop.run(AgentRequest(user_input="1+1=?"))
 
@@ -79,10 +92,11 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(resp.turns_used, 1)
         self.assertEqual(resp.tool_calls, 0)
         self.assertEqual(len(resp.steps), 1)
-        self.assertIsInstance(resp.steps[0].action, FinalAnswer)
+        self.assertEqual(resp.steps[0].final_answer, "42")
+        self.assertEqual(resp.steps[0].tool_calls, [])
 
         # 首轮消息 = system + user，且 max_new_tokens 来自 AgentParams。
-        msgs, max_new_tokens = llm.calls[0]
+        msgs, _, max_new_tokens = llm.calls[0]
         self.assertEqual(msgs[0].role, "system")
         self.assertEqual(msgs[-1].role, "user")
         self.assertEqual(msgs[-1].content, "1+1=?")
@@ -92,8 +106,11 @@ class AgentLoopTest(unittest.TestCase):
         tools = FakeTools("文件内容")
         llm = FakeLLM(
             [
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-                '{"action": "final", "answer": "读完了"}',
+                LLMResponse(
+                    text="",
+                    tool_calls=[tc("read_file", {"path": "a.py"}, "call_x1")],
+                ),
+                "读完了",
             ]
         )
         loop = make_loop(llm, tools=tools)
@@ -105,58 +122,118 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(resp.tool_calls, 1)
         self.assertEqual(tools.calls, [("read_file", {"path": "a.py"})])
 
-        # 第二步模型应看到 assistant（携带 tool_calls 声明）+ tool 观察结果，
-        # 二者通过 tool_call_id=call_1 配对（OpenAI 兼容 API 的硬性要求）。
+        # 第二步模型应看到 assistant（携带原生 tool_calls 声明）+ tool 观察结果，
+        # 二者通过模型返回的原生 id 配对。
         msgs = llm.calls[1][0]
         self.assertEqual(msgs[-2].role, "assistant")
         self.assertEqual(msgs[-1].role, "tool")
         self.assertEqual(msgs[-1].content, "文件内容")
-        self.assertEqual(msgs[-1].tool_call_id, "call_1")
-        self.assertEqual(
-            msgs[-2].tool_calls,
-            [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": '{"path": "a.py"}',
-                    },
-                }
-            ],
-        )
+        self.assertEqual(msgs[-1].tool_call_id, "call_x1")
+        self.assertEqual(msgs[-2].tool_calls[0]["id"], "call_x1")
+        self.assertEqual(msgs[-2].tool_calls[0]["function"]["name"], "read_file")
 
-        # 轨迹里记录了解析出的 ToolCall 与观察。
+        # 轨迹记录工具调用与观察。
         step = resp.steps[0]
-        self.assertIsInstance(step.action, ToolCall)
-        self.assertEqual(step.observation, "文件内容")
+        self.assertEqual(step.tool_calls[0]["id"], "call_x1")
+        self.assertEqual(step.observations, ["文件内容"])
 
-    def test_retry_recovers(self):
+    def test_parallel_tool_calls_executed(self):
+        """原生 FC：一次响应多个 tool_calls → 全部执行（并行语义）。"""
+        tools = FakeTools("结果")
         llm = FakeLLM(
             [
-                "这不是合法 JSON",
-                '{"action": "final", "answer": "重试成功"}',
+                LLMResponse(
+                    text="",
+                    tool_calls=[
+                        tc("read_file", {"path": "a.py"}, "call_a"),
+                        tc("list_files", {"path": "."}, "call_b"),
+                    ],
+                ),
+                "都看完了",
             ]
         )
-        loop = make_loop(llm)
-        resp = loop.run(AgentRequest(user_input="任务"))
+        loop = make_loop(llm, tools=tools)
+        resp = loop.run(AgentRequest(user_input="看两个"))
 
         self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
-        self.assertEqual(resp.final_answer, "重试成功")
-        self.assertEqual(resp.turns_used, 2)
-        self.assertEqual(resp.tool_calls, 0)
-        self.assertIsInstance(resp.steps[0].action, Retry)
+        self.assertEqual(resp.tool_calls, 2)
+        self.assertEqual(
+            tools.calls,
+            [("read_file", {"path": "a.py"}), ("list_files", {"path": "."})],
+        )
 
-        # 重试原因以 role=user 回灌（不伪造工具调用声明）。
+        # 回灌消息：assistant 声明 + 两条 tool 结果，各按原生 id 配对。
         msgs = llm.calls[1][0]
-        self.assertEqual(msgs[-1].role, "user")
-        self.assertIn("输出不符合契约", msgs[-1].content)
+        tool_msgs = [m for m in msgs if m.role == "tool"]
+        self.assertEqual(len(tool_msgs), 2)
+        self.assertEqual(tool_msgs[0].tool_call_id, "call_a")
+        self.assertEqual(tool_msgs[1].tool_call_id, "call_b")
+        assistant = [m for m in msgs if m.role == "assistant" and m.tool_calls][-1]
+        self.assertEqual(assistant.tool_calls[0]["id"], "call_a")
+
+    def test_parallel_gate_batch_deny(self):
+        """审批批量拒绝：两个调用都不执行、不计入、观察提示拒绝。"""
+        tools = FakeTools("结果")
+
+        class Gate:
+            def __init__(self):
+                self.calls = None
+
+            def request_batch(self, calls):
+                self.calls = list(calls)
+                return False
+
+        gate = Gate()
+        llm = FakeLLM(
+            [
+                LLMResponse(
+                    text="",
+                    tool_calls=[
+                        tc("read_file", {"path": "a.py"}, "call_a"),
+                        tc("list_files", {"path": "."}, "call_b"),
+                    ],
+                ),
+                "被拒后直接回答",
+            ]
+        )
+        loop = make_loop(llm, tools=tools, approval_gate=gate)
+        resp = loop.run(AgentRequest(user_input="读"))
+
+        self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
+        self.assertEqual(resp.tool_calls, 0)
+        self.assertEqual(tools.calls, [])
+        self.assertEqual(gate.calls, [("read_file", {"path": "a.py"}), ("list_files", {"path": "."})])
+        # 两条观察都提示拒绝。
+        self.assertTrue(all("用户拒绝" in obs for obs in resp.steps[0].observations))
+
+    def test_parallel_gate_batch_allow(self):
+        """审批批量允许：两个调用都执行。"""
+
+        class Gate:
+            def request_batch(self, calls):
+                return True
+
+        tools = FakeTools("结果")
+        llm = FakeLLM(
+            [
+                LLMResponse(
+                    text="",
+                    tool_calls=[
+                        tc("read_file", {"path": "a.py"}, "call_a"),
+                        tc("list_files", {"path": "."}, "call_b"),
+                    ],
+                ),
+                "完成",
+            ]
+        )
+        loop = make_loop(llm, tools=tools, approval_gate=Gate())
+        resp = loop.run(AgentRequest(user_input="读"))
+        self.assertEqual(resp.tool_calls, 2)
+        self.assertEqual(len(tools.calls), 2)
 
     def test_max_turns_stop(self):
-        tool_call = (
-            '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}'
-        )
-        llm = FakeLLM([tool_call], fallback=tool_call)
+        tool_resp = LLMResponse(text="", tool_calls=[tc("read_file", {"path": "a.py"})])
+        llm = FakeLLM([tool_resp], fallback=tool_resp)
         loop = make_loop(llm, tools=FakeTools())
         resp = loop.run(AgentRequest(user_input="任务", max_turns=3))
 
@@ -169,8 +246,8 @@ class AgentLoopTest(unittest.TestCase):
     def test_no_tools_tool_call_observation(self):
         llm = FakeLLM(
             [
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-                '{"action": "final", "answer": "没有工具也能答"}',
+                LLMResponse(text="", tool_calls=[tc("read_file", {"path": "a.py"})]),
+                "没有工具也能答",
             ]
         )
         loop = make_loop(llm, tools=None)
@@ -184,7 +261,7 @@ class AgentLoopTest(unittest.TestCase):
 
     def test_llm_error(self):
         class BoomLLM:
-            def complete(self, messages, *, max_new_tokens=None):
+            def complete(self, messages, *, tools=None, max_new_tokens=None):
                 raise RuntimeError("boom")
 
         loop = make_loop(BoomLLM())
@@ -197,7 +274,7 @@ class AgentLoopTest(unittest.TestCase):
 
     def test_max_turns_clamped_to_one(self):
         """max_turns <= 0 时按 1 轮收口，保证 turns_used >= 1 的返回值契约。"""
-        llm = FakeLLM(['{"action": "final", "answer": "一轮完成"}'])
+        llm = FakeLLM(["一轮完成"])
         loop = make_loop(llm)
         resp = loop.run(AgentRequest(user_input="任务", max_turns=0))
 
@@ -209,10 +286,11 @@ class AgentLoopTest(unittest.TestCase):
         llm = FakeLLM(
             [
                 LLMResponse(
-                    text='{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
+                    text="",
+                    tool_calls=[tc("read_file", {"path": "a.py"})],
                     metadata={"reasoning_content": "思考过程"},
                 ),
-                '{"action": "final", "answer": "完成"}',
+                "完成",
             ]
         )
         loop = make_loop(llm, tools=FakeTools("观察"))
@@ -226,24 +304,6 @@ class AgentLoopTest(unittest.TestCase):
         rebuilt = step_to_messages(resp.steps[0])
         self.assertEqual(rebuilt[0].metadata, {"reasoning_content": "思考过程"})
 
-    def test_thought_field_ignored_by_parser(self):
-        """prompt 契约含 thought 字段：parse_action 忽略多余字段，主循环正常。"""
-        llm = FakeLLM(
-            [
-                '{"thought": "先看目录结构", "action": "tool_call", "tool": "list_files", "args": {"path": "."}}',
-                '{"thought": "信息充足", "action": "final", "answer": "完成"}',
-            ]
-        )
-        loop = make_loop(llm, tools=FakeTools("目录内容"))
-        resp = loop.run(AgentRequest(user_input="看看目录"))
-
-        self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
-        self.assertEqual(resp.final_answer, "完成")
-        self.assertEqual(resp.tool_calls, 1)
-        # 解析出的 Action 只含契约字段；thought 保留在原始输出中。
-        self.assertEqual(resp.steps[0].action.args, {"path": "."})
-        self.assertIn("thought", resp.steps[0].raw_output)
-
     def test_approval_gate_denies_tool_call(self):
         """审批拒绝：不执行工具、不计 tool_calls、观察提示用户拒绝、模型继续。"""
         tools = FakeTools("文件内容")
@@ -252,15 +312,15 @@ class AgentLoopTest(unittest.TestCase):
             def __init__(self, calls):
                 self.calls = calls
 
-            def request(self, name, args):
-                self.calls.append((name, args))
+            def request_batch(self, calls):
+                self.calls.extend(calls)
                 return False
 
         gate = Gate([])
         llm = FakeLLM(
             [
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-                '{"action": "final", "answer": "被拒后直接回答"}',
+                LLMResponse(text="", tool_calls=[tc("read_file", {"path": "a.py"})]),
+                "被拒后直接回答",
             ]
         )
         loop = make_loop(llm, tools=tools, approval_gate=gate)
@@ -273,20 +333,20 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(tools.calls, [])
         self.assertEqual(gate.calls, [("read_file", {"path": "a.py"})])
         # 观察文本提示用户拒绝，模型能看到。
-        self.assertIn("用户拒绝", resp.steps[0].observation)
+        self.assertIn("用户拒绝", resp.steps[0].observations[0])
 
     def test_approval_gate_allows_tool_call(self):
         """审批允许：正常执行、计入 tool_calls。"""
 
         class Gate:
-            def request(self, name, args):
+            def request_batch(self, calls):
                 return True
 
         tools = FakeTools("文件内容")
         llm = FakeLLM(
             [
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-                '{"action": "final", "answer": "读完"}',
+                LLMResponse(text="", tool_calls=[tc("read_file", {"path": "a.py"})]),
+                "读完",
             ]
         )
         loop = make_loop(llm, tools=tools, approval_gate=Gate())
@@ -301,8 +361,8 @@ class AgentLoopTest(unittest.TestCase):
         tools = FakeTools("文件内容")
         llm = FakeLLM(
             [
-                '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}',
-                '{"action": "final", "answer": "读完"}',
+                LLMResponse(text="", tool_calls=[tc("read_file", {"path": "a.py"})]),
+                "读完",
             ]
         )
         loop = make_loop(llm, tools=tools)  # 不传 approval_gate
@@ -312,9 +372,44 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(resp.tool_calls, 1)
         self.assertEqual(tools.calls, [("read_file", {"path": "a.py"})])
 
+    def test_tools_passed_to_llm(self):
+        """主循环每次调用都把注册表工具传给 LLM（tools 参数非空）。"""
+        llm = FakeLLM(["42"])
+        loop = make_loop(llm)
+        loop.run(AgentRequest(user_input="任务"))
+        _, tools, _ = llm.calls[0]
+        names = [t["function"]["name"] for t in tools]
+        self.assertIn("read_file", names)
+        self.assertIn("list_files", names)
+        for tool in tools:
+            self.assertEqual(tool["type"], "function")
+
+    def test_invalid_arguments_json_handled(self):
+        """arguments 不是合法 JSON 时按空参数执行，不崩溃。"""
+        tools = FakeTools("结果")
+        llm = FakeLLM(
+            [
+                LLMResponse(
+                    text="",
+                    tool_calls=[
+                        {
+                            "id": "call_bad",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "不是JSON"},
+                        }
+                    ],
+                ),
+                "完成",
+            ]
+        )
+        loop = make_loop(llm, tools=tools)
+        resp = loop.run(AgentRequest(user_input="任务"))
+        self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
+        self.assertEqual(tools.calls, [("read_file", {})])
+
     def test_history_preserved_and_untouched(self):
         history = [Message(role="user", content="旧消息")]
-        llm = FakeLLM(['{"action": "final", "answer": "完成"}'])
+        llm = FakeLLM(["完成"])
         loop = make_loop(llm)
         resp = loop.run(AgentRequest(user_input="新消息", messages=history))
 
@@ -327,33 +422,45 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(msgs[1].content, "旧消息")
         self.assertEqual(msgs[2].content, "新消息")
 
-    def test_non_object_json_retry(self):
-        """模型输出合法 JSON 但不是对象（字符串/数组）时，应走 Retry 而非崩溃。"""
-        llm = FakeLLM(
-            [
-                '"我不是对象"',
-                '{"action": "final", "answer": "恢复了"}',
-            ]
-        )
-        loop = make_loop(llm)
-        resp = loop.run(AgentRequest(user_input="任务"))
-
-        self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
-        self.assertEqual(resp.final_answer, "恢复了")
-        self.assertEqual(resp.turns_used, 2)
-        self.assertIsInstance(resp.steps[0].action, Retry)
-
     def test_request_max_turns_overrides_params(self):
         params = AgentParams(max_turns=100)
-        tool_call = (
-            '{"action": "tool_call", "tool": "read_file", "args": {"path": "a.py"}}'
-        )
-        llm = FakeLLM([tool_call], fallback=tool_call)
+        tool_resp = LLMResponse(text="", tool_calls=[tc("read_file", {"path": "a.py"})])
+        llm = FakeLLM([tool_resp], fallback=tool_resp)
         loop = AgentLoop(params, llm=llm, tools=FakeTools())
         resp = loop.run(AgentRequest(user_input="任务", max_turns=2))
 
         self.assertEqual(resp.stop_reason, StopReason.MAX_TURNS)
         self.assertEqual(resp.turns_used, 2)
+
+
+class StepToMessagesTest(unittest.TestCase):
+    """step_to_messages：轨迹 → 消息（工具轮 / 答案轮）。"""
+
+    def test_tool_step_pairs_with_native_ids(self):
+        from myagent.contracts import StepRecord
+
+        step = StepRecord(
+            turn=1,
+            raw_output="",
+            tool_calls=[tc("read_file", {"path": "a.py"}, "call_9")],
+            observations=["内容"],
+        )
+        msgs = step_to_messages(step)
+        self.assertEqual(msgs[0].role, "assistant")
+        self.assertEqual(msgs[0].tool_calls[0]["id"], "call_9")
+        self.assertEqual(msgs[1].role, "tool")
+        self.assertEqual(msgs[1].content, "内容")
+        self.assertEqual(msgs[1].tool_call_id, "call_9")
+
+    def test_final_step_single_assistant(self):
+        from myagent.contracts import StepRecord
+
+        step = StepRecord(turn=1, raw_output="答案", final_answer="答案")
+        msgs = step_to_messages(step)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0].role, "assistant")
+        self.assertEqual(msgs[0].content, "答案")
+        self.assertEqual(msgs[0].tool_calls, [])
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from myagent.tools import TOOLS, ToolExecutor, list_tools, register_tool
-from myagent.tools.render import render_tool_section
+from myagent.tools.registry import to_openai_tools
 
 EXPECTED_TOOLS = {
     "read_file",
@@ -103,14 +103,34 @@ class ExecutorTest(unittest.TestCase):
         out = self.executor.execute("read_file", {"path": "missing.txt"})
         self.assertTrue(out.startswith("错误：文件不存在"))
 
-    def test_render_tool_section(self):
-        """动态渲染的工具段应覆盖全部注册工具，且不含未注册名。"""
-        section = render_tool_section()
+    def test_to_openai_tools(self):
+        """OpenAI tools 数组应覆盖全部注册工具，含正确的 name/description/parameters。"""
+        tools = to_openai_tools()
+        names = [t["function"]["name"] for t in tools]
         for name in EXPECTED_TOOLS:
-            self.assertIn(f"### {name}", section)
-            self.assertIn(f'"tool": "{name}"', section)
-        self.assertNotIn("list_dir", section)
-        self.assertNotIn("{tool_list}", section)
+            self.assertIn(name, names)
+        self.assertNotIn("list_dir", names)
+        for tool in tools:
+            self.assertEqual(tool["type"], "function")
+            function = tool["function"]
+            self.assertTrue(function["description"])
+            # parameters 是合法 JSON Schema 对象（顶层 type: object）。
+            self.assertIsInstance(function["parameters"], dict)
+            self.assertEqual(function["parameters"]["type"], "object")
+            self.assertIsInstance(function["parameters"]["properties"], dict)
+
+    def test_to_openai_tools_required_and_strip(self):
+        """参数级 required 汇总到顶层，required/default 键从属性中剥离。"""
+        tools = to_openai_tools()
+        read_file = next(
+            t for t in tools if t["function"]["name"] == "read_file"
+        )
+        params = read_file["function"]["parameters"]
+        self.assertEqual(params["required"], ["path"])
+        # 属性内不允许残留 required / default 键。
+        for prop in params["properties"].values():
+            self.assertNotIn("required", prop)
+            self.assertNotIn("default", prop)
 
     def test_execute_does_not_raise(self):
         for name in EXPECTED_TOOLS:

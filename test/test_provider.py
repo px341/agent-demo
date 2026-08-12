@@ -22,7 +22,7 @@ from myagent.provider import DEFAULT_MODEL, OpenAICompatibleModelClient
 
 
 class FakeCompletions:
-    """记录 create() 参数，返回固定内容（可选带 reasoning_content）。"""
+    """记录 create() 参数，返回固定内容（可选带 reasoning_content / tool_calls）。"""
 
     def __init__(
         self,
@@ -33,6 +33,7 @@ class FakeCompletions:
         self.content = content
         self.reasoning = reasoning
         self.via_model_extra = via_model_extra
+        self.tool_calls = None
         self.kwargs: dict | None = None
 
     def create(self, **kwargs):
@@ -47,6 +48,8 @@ class FakeCompletions:
             msg = SimpleNamespace(content=self.content)
             if self.reasoning is not None:
                 msg.reasoning_content = self.reasoning
+        if self.tool_calls is not None:
+            msg.tool_calls = self.tool_calls
         return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
 
 
@@ -162,14 +165,31 @@ class ProviderCompleteTest(unittest.TestCase):
         self.assertNotIn("reasoning_content", fake.kwargs["messages"][0])
 
     def test_complete_drives_agent_loop(self):
-        """complete() 满足 LLMClient Protocol：返回文本可被主循环解析为 final。"""
-        client, fake = make_client('{"action": "final", "answer": "集成OK"}')
+        """complete() 满足 LLMClient Protocol：返回文本即 final 答案。"""
+        client, fake = make_client("集成OK")
         loop = AgentLoop(AgentParams(), llm=client)
         resp = loop.run(AgentRequest(user_input="任务"))
 
         self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
         self.assertEqual(resp.final_answer, "集成OK")
         self.assertEqual(fake.kwargs["max_tokens"], AgentParams().max_output_tokens)
+        # 主循环传入 tools 数组（注册表渲染）。
+        self.assertIn("tools", fake.kwargs)
+
+    def test_complete_parses_native_tool_calls(self):
+        """complete() 把原生 tool_calls 填进 LLMResponse。"""
+        client, fake = make_client("")
+        fake.tool_calls = [
+            SimpleNamespace(
+                id="call_abc",
+                type="function",
+                function=SimpleNamespace(name="read_file", arguments='{"path": "a.py"}'),
+            )
+        ]
+        resp = client.complete([Message(role="user", content="读")])
+        self.assertEqual(len(resp.tool_calls), 1)
+        self.assertEqual(resp.tool_calls[0]["id"], "call_abc")
+        self.assertEqual(resp.tool_calls[0]["function"]["name"], "read_file")
 
     def test_model_from_env_with_default(self):
         with mock.patch.dict("os.environ", {"DEEPSEEK_MODEL": "my-model"}):
