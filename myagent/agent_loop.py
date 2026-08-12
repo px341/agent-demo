@@ -35,6 +35,7 @@ from .contracts import (
     ToolExecutor,
 )
 from .environment import build_environment_prompt
+from .errors import ToolError
 from .tools.registry import to_openai_tools
 
 
@@ -226,7 +227,7 @@ class AgentLoop:
                     args = {}
                 calls.append((name, args))
 
-            observations, executed = self._execute_tool_batch(calls)
+            observations, executed, fatal = self._execute_tool_batch(calls)
             tool_calls += executed
 
             step = StepRecord(
@@ -239,6 +240,20 @@ class AgentLoop:
             steps.append(step)
             messages.extend(step_to_messages(step))
 
+            if fatal is not None:
+                # 不可恢复错误：终止本轮 ReAct 循环。
+                # step 已 append 进 steps 并重建进 messages，
+                # 保证 REPL history / memory 存档记录了完整
+                # assistant(tool_calls) + tool(错误) 配对。
+                return AgentResponse(
+                    final_answer=None,
+                    stop_reason=StopReason.TOOL_ERROR,
+                    turns_used=turn,
+                    tool_calls=tool_calls,
+                    steps=steps,
+                    error=fatal,
+                )
+
         # 循环自然结束 = 达到轮数上限。
         return AgentResponse(
             final_answer=None,
@@ -248,34 +263,47 @@ class AgentLoop:
             steps=steps,
         )
 
-    def _execute_tool_batch(self, calls: list[tuple[str, dict]]) -> tuple[list[str], int]:
-        """并行执行一批工具调用，返回 (观察结果列表, 实际执行数)。
+    def _execute_tool_batch(self, calls: list[tuple[str, dict]]) -> tuple[list[str], int, str | None]:
+        """执行一批工具调用，返回 (观察结果列表, 实际执行数, 致命错误文本)。
 
-        审批闸门存在时整批询问一次，拒绝则整批不执行、不计执行数；
-        任何失败都转成错误文本观察。
+        审批闸门存在时整批询问一次，拒绝 → ApprovalDenied（不可恢复）终止。
+        工具抛 ToolError：
+        - recoverable（Validation/NotFound）→ 转错误文本观察，继续循环；
+        - 不可恢复（Permission/Timeout/Execution/Approval）→ 返回致命错误，
+          由主循环终止本轮（观察文本仍用于会话记录）。
         """
         if self.tools is None:
             prefix = "错误：当前未启用工具，无法调用"
             return (
                 [f"{prefix} {name!r}；请直接给出最终答案。" for name, _ in calls],
                 0,
+                None,
             )
 
         if self.approval_gate is not None and not self.approval_gate.request_batch(
             calls
         ):
+            from .errors import ApprovalDenied
+
+            message = str(ApprovalDenied("用户拒绝了这批工具调用"))
             return (
-                [
-                    "错误：用户拒绝了这批工具调用；请改用其他方式或直接给出最终答案。"
-                    for _ in calls
-                ],
+                [message for _ in calls],
                 0,
+                message,
             )
 
         observations = []
         for name, args in calls:
             try:
                 observations.append(str(self.tools.execute(name, args)))
+            except ToolError as exc:
+                message = str(exc)
+                observations.append(message)
+                if not exc.recoverable:
+                    # 不可恢复：记录本调用错误后立即终止整批。
+                    return observations, len(observations), message
             except Exception as exc:
-                observations.append(f"错误：工具 {name} 执行失败：{exc}")
-        return observations, len(calls)
+                message = f"ToolError[ExecutionError]: 工具 {name} 执行失败：{exc}"
+                observations.append(message)
+                return observations, len(observations), message
+        return observations, len(calls), None

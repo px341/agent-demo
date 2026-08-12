@@ -1,12 +1,14 @@
 """文件类工具：读取 / 创建 / 写入 / 编辑 / 删除。
 
-每个工具都通过 safe_resolve 限制在工作目录内；任何失败都返回
-以「错误：」开头的文本，由执行器回传给模型。
+每个工具都通过 safe_resolve 限制在工作目录内；错误按分类抛
+myagent.errors 的异常（NotFoundError / ValidationError /
+ToolPermissionError），由 executor 与主循环统一处理。
 """
 from __future__ import annotations
 
 from pathlib import Path
 
+from ..errors import NotFoundError, ToolPermissionError, ValidationError
 from .common import safe_resolve
 from .registry import register_tool
 
@@ -26,12 +28,12 @@ _PARAM_PATH = {"type": "string", "required": True, "description": "文件路径�
 def read_file(args: dict, cwd: Path) -> str:
     path = safe_resolve(cwd, args["path"])
     if not path.is_file():
-        return f"错误：文件不存在：{args['path']}"
+        raise NotFoundError(f"文件不存在：{args['path']}")
     lines = path.read_text(encoding="utf-8").splitlines()
     start = max(1, int(args.get("start_line") or 1))
     end = min(len(lines), int(args["end_line"])) if args.get("end_line") is not None else len(lines)
     if start > end:
-        return f"错误：行区间无效（{start} > {end}）"
+        raise ValidationError(f"行区间无效（{start} > {end}）")
     content = "\n".join(lines[start - 1 : end])
     return f"{args['path']}（第 {start}-{end} 行，共 {len(lines)} 行）：\n{content}"
 
@@ -47,7 +49,7 @@ def read_file(args: dict, cwd: Path) -> str:
 def create_file(args: dict, cwd: Path) -> str:
     path = safe_resolve(cwd, args["path"])
     if path.exists():
-        return f"错误：文件已存在：{args['path']}"
+        raise ValidationError(f"文件已存在：{args['path']}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(args.get("content", "")), encoding="utf-8")
     return f"已创建文件：{args['path']}"
@@ -80,15 +82,15 @@ def write_file(args: dict, cwd: Path) -> str:
 def edit_file(args: dict, cwd: Path) -> str:
     path = safe_resolve(cwd, args["path"])
     if not path.is_file():
-        return f"错误：文件不存在：{args['path']}"
+        raise NotFoundError(f"文件不存在：{args['path']}")
     old_text = str(args["old_text"])
     new_text = str(args.get("new_text", ""))
     content = path.read_text(encoding="utf-8")
     count = content.count(old_text)
     if count == 0:
-        return "错误：文件中未找到要替换的文本"
+        raise ValidationError("文件中未找到要替换的文本")
     if count > 1:
-        return f"错误：要替换的文本出现 {count} 次，请提供更精确的匹配"
+        raise ValidationError(f"要替换的文本出现 {count} 次，请提供更精确的匹配")
     path.write_text(content.replace(old_text, new_text), encoding="utf-8")
     return f"已修改 {args['path']}：替换 1 处"
 
@@ -102,6 +104,6 @@ def edit_file(args: dict, cwd: Path) -> str:
 def delete_file(args: dict, cwd: Path) -> str:
     path = safe_resolve(cwd, args["path"])
     if not path.is_file():
-        return f"错误：文件不存在：{args['path']}"
+        raise NotFoundError(f"文件不存在：{args['path']}")
     path.unlink()
     return f"已删除文件：{args['path']}"

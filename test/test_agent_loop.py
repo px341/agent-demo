@@ -172,7 +172,7 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(assistant.tool_calls[0]["id"], "call_a")
 
     def test_parallel_gate_batch_deny(self):
-        """审批批量拒绝：两个调用都不执行、不计入、观察提示拒绝。"""
+        """审批批量拒绝：两个调用都不执行、终止 TOOL_ERROR。"""
         tools = FakeTools("结果")
 
         class Gate:
@@ -199,12 +199,12 @@ class AgentLoopTest(unittest.TestCase):
         loop = make_loop(llm, tools=tools, approval_gate=gate)
         resp = loop.run(AgentRequest(user_input="读"))
 
-        self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
+        self.assertEqual(resp.stop_reason, StopReason.TOOL_ERROR)
         self.assertEqual(resp.tool_calls, 0)
         self.assertEqual(tools.calls, [])
         self.assertEqual(gate.calls, [("read_file", {"path": "a.py"}), ("list_files", {"path": "."})])
-        # 两条观察都提示拒绝。
-        self.assertTrue(all("用户拒绝" in obs for obs in resp.steps[0].observations))
+        # 两条观察都含 ApprovalDenied。
+        self.assertTrue(all("ApprovalDenied" in obs for obs in resp.steps[0].observations))
 
     def test_parallel_gate_batch_allow(self):
         """审批批量允许：两个调用都执行。"""
@@ -305,7 +305,7 @@ class AgentLoopTest(unittest.TestCase):
         self.assertEqual(rebuilt[0].metadata, {"reasoning_content": "思考过程"})
 
     def test_approval_gate_denies_tool_call(self):
-        """审批拒绝：不执行工具、不计 tool_calls、观察提示用户拒绝、模型继续。"""
+        """审批拒绝（ApprovalDenied）：不执行工具、终止本轮 TOOL_ERROR。"""
         tools = FakeTools("文件内容")
 
         class Gate:
@@ -320,20 +320,23 @@ class AgentLoopTest(unittest.TestCase):
         llm = FakeLLM(
             [
                 LLMResponse(text="", tool_calls=[tc("read_file", {"path": "a.py"})]),
-                "被拒后直接回答",
+                "被拒后直接回答",  # 不应被用到（审批拒绝即终止）
             ]
         )
         loop = make_loop(llm, tools=tools, approval_gate=gate)
         resp = loop.run(AgentRequest(user_input="读文件"))
 
-        self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
-        self.assertEqual(resp.final_answer, "被拒后直接回答")
+        self.assertEqual(resp.stop_reason, StopReason.TOOL_ERROR)
+        self.assertIsNone(resp.final_answer)
+        self.assertIn("ApprovalDenied", resp.error)
         self.assertEqual(resp.tool_calls, 0)
-        # 工具未执行，闸门被询问且收到拒绝。
         self.assertEqual(tools.calls, [])
         self.assertEqual(gate.calls, [("read_file", {"path": "a.py"})])
-        # 观察文本提示用户拒绝，模型能看到。
-        self.assertIn("用户拒绝", resp.steps[0].observations[0])
+        # 错误 step 已记录（会话轨迹完整）。
+        self.assertEqual(len(resp.steps), 1)
+        self.assertIn("ApprovalDenied", resp.steps[0].observations[0])
+        # 只用了一次 LLM 调用（未进入下一轮）。
+        self.assertEqual(len(llm.calls), 1)
 
     def test_approval_gate_allows_tool_call(self):
         """审批允许：正常执行、计入 tool_calls。"""

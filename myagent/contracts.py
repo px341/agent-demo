@@ -171,6 +171,9 @@ class StopReason(str, Enum):
     #: 达到轮数上限（模型始终未给出最终答案）。
     MAX_TURNS = "max_turns"
 
+    #: 工具调用触发不可恢复错误（Permission / Timeout / Execution / 审批拒绝）。
+    TOOL_ERROR = "tool_error"
+
     #: LLM 调用抛出异常。
     ERROR = "error"
 

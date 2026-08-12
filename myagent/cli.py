@@ -78,7 +78,7 @@ def main() -> int:
     loop = AgentLoop(
         agent_params,
         llm=client,
-        tools=ToolExecutor(agent_params.cwd),
+        tools=ToolExecutor(agent_params.cwd, timeout=agent_params.tool_timeout),
         approval_gate=ConsoleApprovalGate(),
         memory=memory,
         composer=composer,
@@ -194,6 +194,9 @@ def _print_response(response: AgentResponse) -> int:
         return 0
     if response.stop_reason is StopReason.MAX_TURNS:
         print(f"⚠️ 达到轮数上限（{response.turns_used} 轮），已停止。")
+        return 1
+    if response.stop_reason is StopReason.TOOL_ERROR:
+        print(f"⛔ 工具错误，本轮任务终止：{response.error}")
         return 1
     print(f"❌ 出错：{response.error}")
     return 1

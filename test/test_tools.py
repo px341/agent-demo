@@ -13,6 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from myagent.tools import TOOLS, ToolExecutor, list_tools, register_tool
 from myagent.tools.registry import to_openai_tools
+from myagent.errors import (
+    ExecutionError,
+    NotFoundError,
+    ToolError,
+    ToolPermissionError,
+    ToolTimeoutError,
+    ValidationError,
+)
 
 EXPECTED_TOOLS = {
     "read_file",
@@ -79,29 +87,68 @@ class ExecutorTest(unittest.TestCase):
         self.executor = ToolExecutor(self._tmp.name)
 
     def test_unknown_tool(self):
-        out = self.executor.execute("no_such_tool", {})
-        self.assertTrue(out.startswith("错误：未知工具"))
-        self.assertIn("read_file", out)
+        with self.assertRaises(ValidationError) as ctx:
+            self.executor.execute("no_such_tool", {})
+        self.assertIn("read_file", str(ctx.exception))
 
     def test_missing_required_param(self):
-        out = self.executor.execute("read_file", {})
-        self.assertIn("缺少参数", out)
-        self.assertIn("path", out)
+        with self.assertRaises(ValidationError) as ctx:
+            self.executor.execute("read_file", {})
+        self.assertIn("缺少参数", str(ctx.exception))
+        self.assertIn("path", str(ctx.exception))
 
     def test_param_type_validation(self):
-        out = self.executor.execute("read_file", {"path": 123})
-        self.assertIn("必须是字符串", out)
-        out = self.executor.execute("delete_dir", {"path": "d", "recursive": "yes"})
-        self.assertIn("必须是布尔值", out)
-        out = self.executor.execute("read_file", {"path": "a.py", "start_line": "x"})
-        self.assertIn("必须是整数", out)
+        with self.assertRaises(ValidationError) as ctx:
+            self.executor.execute("read_file", {"path": 123})
+        self.assertIn("必须是字符串", str(ctx.exception))
+        with self.assertRaises(ValidationError) as ctx:
+            self.executor.execute("delete_dir", {"path": "d", "recursive": "yes"})
+        self.assertIn("必须是布尔值", str(ctx.exception))
+        with self.assertRaises(ValidationError) as ctx:
+            self.executor.execute("read_file", {"path": "a.py", "start_line": "x"})
+        self.assertIn("必须是整数", str(ctx.exception))
         # bool 是 int 子类，需显式拒绝。
-        out = self.executor.execute("read_file", {"path": "a.py", "start_line": True})
-        self.assertIn("必须是整数", out)
+        with self.assertRaises(ValidationError) as ctx:
+            self.executor.execute("read_file", {"path": "a.py", "start_line": True})
+        self.assertIn("必须是整数", str(ctx.exception))
 
     def test_error_as_observation_text(self):
-        out = self.executor.execute("read_file", {"path": "missing.txt"})
-        self.assertTrue(out.startswith("错误：文件不存在"))
+        with self.assertRaises(NotFoundError):
+            self.executor.execute("read_file", {"path": "missing.txt"})
+
+    def test_unknown_exception_wrapped_as_execution_error(self):
+        """工具抛非 ToolError 的未知异常 → 包装为 ExecutionError。"""
+        from myagent.tools.registry import register_tool
+
+        @register_tool("_boom_tool")
+        def _boom(args, cwd):
+            raise RuntimeError("内部爆炸")
+
+        try:
+            with self.assertRaises(ExecutionError) as ctx:
+                self.executor.execute("_boom_tool", {})
+            self.assertIn("内部爆炸", str(ctx.exception))
+        finally:
+            del TOOLS["_boom_tool"]
+
+    def test_timeout_raises_tool_timeout(self):
+        """超时机制：短 timeout + 卡住工具 → ToolTimeoutError。"""
+        from myagent.tools.registry import register_tool
+
+        @register_tool("_slow_tool")
+        def _slow(args, cwd):
+            import time
+
+            time.sleep(5)
+            return "太慢了"
+
+        slow_executor = ToolExecutor(self._tmp.name, timeout=0.1)
+        try:
+            with self.assertRaises(ToolTimeoutError) as ctx:
+                slow_executor.execute("_slow_tool", {})
+            self.assertIn("超过", str(ctx.exception))
+        finally:
+            del TOOLS["_slow_tool"]
 
     def test_to_openai_tools(self):
         """OpenAI tools 数组应覆盖全部注册工具，含正确的 name/description/parameters。"""
@@ -132,12 +179,21 @@ class ExecutorTest(unittest.TestCase):
             self.assertNotIn("required", prop)
             self.assertNotIn("default", prop)
 
-    def test_execute_does_not_raise(self):
-        for name in EXPECTED_TOOLS:
-            args = {"path": "x", "content": "c", "old_text": "a", "new_text": "b",
-                    "src": "a", "dst": "b", "recursive": True, "start_line": 1}
-            out = self.executor.execute(name, args)
-            self.assertIsInstance(out, str)
+    def test_execute_returns_string_on_success(self):
+        """合法参数下工具正常返回字符串，不抛异常。"""
+        self.executor.execute("write_file", {"path": "x.txt", "content": "c"})
+        out = self.executor.execute("read_file", {"path": "x.txt", "start_line": 1})
+        self.assertIsInstance(out, str)
+        self.assertIn("x.txt", out)
+
+    def test_failures_raise_tool_error_not_bare(self):
+        """失败抛 ToolError 子类，而非裸异常（如 KeyError/ValueError）。"""
+        with self.assertRaises(ToolError):
+            self.executor.execute("read_file", {"path": "missing.txt"})
+        with self.assertRaises(ToolError):
+            self.executor.execute("read_file", {"path": "../escape"})
+        with self.assertRaises(ToolError):
+            self.executor.execute("read_file", {"path": "x.txt", "start_line": "bad"})
 
 
 class FileToolsTest(unittest.TestCase):
@@ -152,9 +208,9 @@ class FileToolsTest(unittest.TestCase):
         out = self.executor.execute("create_file", {"path": "a.txt", "content": "hello world"})
         self.assertIn("已创建", out)
         self.assertTrue((self.root / "a.txt").is_file())
-        # create 已存在 → 失败
-        out = self.executor.execute("create_file", {"path": "a.txt"})
-        self.assertTrue(out.startswith("错误：文件已存在"))
+        # create 已存在 → ValidationError
+        with self.assertRaises(ValidationError):
+            self.executor.execute("create_file", {"path": "a.txt"})
         # write 覆盖
         self.executor.execute("write_file", {"path": "a.txt", "content": "hello myagent\n第二行"})
         self.assertEqual((self.root / "a.txt").read_text(), "hello myagent\n第二行")
@@ -170,14 +226,15 @@ class FileToolsTest(unittest.TestCase):
         out = self.executor.execute("delete_file", {"path": "a.txt"})
         self.assertIn("已删除", out)
         self.assertFalse((self.root / "a.txt").exists())
-        # delete 不存在 → 错误
-        out = self.executor.execute("delete_file", {"path": "a.txt"})
-        self.assertTrue(out.startswith("错误：文件不存在"))
+        # delete 不存在 → NotFoundError
+        with self.assertRaises(NotFoundError):
+            self.executor.execute("delete_file", {"path": "a.txt"})
 
     def test_edit_requires_unique_match(self):
         self.executor.execute("write_file", {"path": "b.txt", "content": "x x x"})
-        out = self.executor.execute("edit_file", {"path": "b.txt", "old_text": "x", "new_text": "y"})
-        self.assertIn("出现 3 次", out)
+        with self.assertRaises(ValidationError) as ctx:
+            self.executor.execute("edit_file", {"path": "b.txt", "old_text": "x", "new_text": "y"})
+        self.assertIn("出现 3 次", str(ctx.exception))
 
     def test_write_file_creates_parents(self):
         self.executor.execute("write_file", {"path": "deep/nested/f.txt", "content": "hi"})
@@ -195,9 +252,10 @@ class DirToolsTest(unittest.TestCase):
         # create_dir 单层（父目录是根，存在）
         self.executor.execute("create_dir", {"path": "d1"})
         self.assertTrue((self.root / "d1").is_dir())
-        # create_dir 父目录缺失 → 提示用 write_dir
-        out = self.executor.execute("create_dir", {"path": "x/y"})
-        self.assertIn("write_dir", out)
+        # create_dir 父目录缺失 → NotFoundError（提示用 write_dir）
+        with self.assertRaises(NotFoundError) as ctx:
+            self.executor.execute("create_dir", {"path": "x/y"})
+        self.assertIn("write_dir", str(ctx.exception))
         # write_dir 递归
         self.executor.execute("write_dir", {"path": "a/b/c"})
         self.assertTrue((self.root / "a" / "b" / "c").is_dir())
@@ -210,9 +268,10 @@ class DirToolsTest(unittest.TestCase):
         self.assertIn("已重命名", out)
         self.assertTrue((self.root / "d2").is_dir())
         self.assertFalse((self.root / "d1").exists())
-        # delete_dir 非空默认失败
-        out = self.executor.execute("delete_dir", {"path": "d2"})
-        self.assertIn("非空", out)
+        # delete_dir 非空默认失败 → ValidationError
+        with self.assertRaises(ValidationError) as ctx:
+            self.executor.execute("delete_dir", {"path": "d2"})
+        self.assertIn("非空", str(ctx.exception))
         # delete_dir 递归
         out = self.executor.execute("delete_dir", {"path": "d2", "recursive": True})
         self.assertIn("递归", out)
@@ -237,14 +296,16 @@ class PathSafetyTest(unittest.TestCase):
         self.executor = ToolExecutor(self.root)
 
     def test_parent_traversal_rejected(self):
-        out = self.executor.execute("read_file", {"path": "../outside.txt"})
-        self.assertIn("路径越界", out)
+        with self.assertRaises(ToolPermissionError) as ctx:
+            self.executor.execute("read_file", {"path": "../outside.txt"})
+        self.assertIn("路径越界", str(ctx.exception))
 
     def test_absolute_path_outside_rejected(self):
         outside_file = self.outside / "secret.txt"
         outside_file.write_text("secret")
-        out = self.executor.execute("read_file", {"path": str(outside_file)})
-        self.assertIn("路径越界", out)
+        with self.assertRaises(ToolPermissionError) as ctx:
+            self.executor.execute("read_file", {"path": str(outside_file)})
+        self.assertIn("路径越界", str(ctx.exception))
 
     def test_relative_path_inside_allowed(self):
         (self.root / "in.txt").write_text("ok")
@@ -252,8 +313,9 @@ class PathSafetyTest(unittest.TestCase):
         self.assertIn("ok", out)
 
     def test_delete_rejects_escape(self):
-        out = self.executor.execute("delete_file", {"path": "../victim.txt"})
-        self.assertIn("路径越界", out)
+        with self.assertRaises(ToolPermissionError) as ctx:
+            self.executor.execute("delete_file", {"path": "../victim.txt"})
+        self.assertIn("路径越界", str(ctx.exception))
 
     def test_symlink_escape_rejected(self):
         """symlink 指向 cwd 之外：resolve 展开后应被拒。"""
@@ -263,8 +325,9 @@ class PathSafetyTest(unittest.TestCase):
         link = self.root / "link"
         link.symlink_to(outside_dir, target_is_directory=True)
 
-        out = self.executor.execute("read_file", {"path": "link/secret.txt"})
-        self.assertIn("路径越界", out)
+        with self.assertRaises(ToolPermissionError) as ctx:
+            self.executor.execute("read_file", {"path": "link/secret.txt"})
+        self.assertIn("路径越界", str(ctx.exception))
 
     def test_relative_path_resolution_inside(self):
         """sub/../in.txt 这类合法回落路径应放行（解析后仍在 cwd 内）。"""
@@ -275,21 +338,21 @@ class PathSafetyTest(unittest.TestCase):
 
     def test_invalid_param_value_is_param_error(self):
         (self.root / "a.txt").write_text("line1\nline2")
-        out = self.executor.execute(
-            "read_file", {"path": "a.txt", "start_line": "abc"}
-        )
-        # schema 校验更早拦截：类型错误在 int() 转换前被拒绝。
-        self.assertIn("必须是整数", out)
+        with self.assertRaises(ValidationError) as ctx:
+            self.executor.execute(
+                "read_file", {"path": "a.txt", "start_line": "abc"}
+            )
+        self.assertIn("必须是整数", str(ctx.exception))
 
     def test_delete_dir_rejects_cwd(self):
-        out = self.executor.execute("delete_dir", {"path": "."})
-        self.assertIn("禁止删除工作目录本身", out)
-        out = self.executor.execute("delete_dir", {"path": ".", "recursive": True})
-        self.assertIn("禁止删除工作目录本身", out)
+        with self.assertRaises(ToolPermissionError):
+            self.executor.execute("delete_dir", {"path": "."})
+        with self.assertRaises(ToolPermissionError):
+            self.executor.execute("delete_dir", {"path": ".", "recursive": True})
 
     def test_rename_dir_rejects_cwd(self):
-        out = self.executor.execute("rename_dir", {"src": ".", "dst": "moved"})
-        self.assertIn("禁止重命名工作目录本身", out)
+        with self.assertRaises(ToolPermissionError):
+            self.executor.execute("rename_dir", {"src": ".", "dst": "moved"})
 
 
 if __name__ == "__main__":

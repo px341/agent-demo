@@ -35,6 +35,9 @@ class AgentParams:
     # 上下文压缩：历史中所有 tool 输出的总 token 上限（超出丢弃最早结果）。
     max_total_tool_tokens: int = 30000
 
+    # 工具执行超时秒数；None / <=0 表示不超时。
+    tool_timeout: float | None = None
+
     # 记忆存档目录：会话原文 jsonl + 摘要 + .state 水位线；空串表示不启用记忆。
     memory_dir: str = MEMORY_DIR
 

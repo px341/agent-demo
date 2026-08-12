@@ -6,12 +6,16 @@
 - write_dir   ：递归创建目录结构（mkdir -p，对应「写入目录」）；
 - rename_dir  ：重命名/移动目录（对应「修改目录」）；
 - delete_dir  ：删除目录，默认仅空目录（对应「删除目录」）。
+
+错误按分类抛 myagent.errors 的异常（NotFoundError / ValidationError /
+ToolPermissionError），由 executor 与主循环统一处理。
 """
 from __future__ import annotations
 
 import shutil
 from pathlib import Path
 
+from ..errors import NotFoundError, ToolPermissionError, ValidationError
 from .common import safe_resolve
 from .registry import register_tool
 
@@ -29,7 +33,7 @@ _PARAM_PATH = {"type": "string", "required": True, "description": "目录路径�
 def list_files(args: dict, cwd: Path) -> str:
     path = safe_resolve(cwd, args.get("path", "."))
     if not path.is_dir():
-        return f"错误：目录不存在：{args.get('path', '.')}"
+        raise NotFoundError(f"目录不存在：{args.get('path', '.')}")
     items = sorted(
         str(item.name) + ("/" if item.is_dir() else "")
         for item in path.iterdir()
@@ -49,9 +53,9 @@ def create_dir(args: dict, cwd: Path) -> str:
     try:
         path.mkdir()
     except FileExistsError:
-        return f"错误：目录已存在：{args['path']}"
+        raise ValidationError(f"目录已存在：{args['path']}")
     except FileNotFoundError:
-        return f"错误：父目录不存在：{args['path']}；如需递归创建请用 write_dir"
+        raise NotFoundError(f"父目录不存在：{args['path']}；如需递归创建请用 write_dir")
     return f"已创建目录：{args['path']}"
 
 
@@ -78,11 +82,11 @@ def rename_dir(args: dict, cwd: Path) -> str:
     src = safe_resolve(cwd, args["src"])
     dst = safe_resolve(cwd, args["dst"])
     if not src.is_dir():
-        return f"错误：目录不存在：{args['src']}"
+        raise NotFoundError(f"目录不存在：{args['src']}")
     if src == cwd.resolve():
-        return "错误：禁止重命名工作目录本身"
+        raise ToolPermissionError("禁止重命名工作目录本身")
     if dst.exists():
-        return f"错误：目标已存在：{args['dst']}"
+        raise ValidationError(f"目标已存在：{args['dst']}")
     shutil.move(str(src), str(dst))
     return f"已重命名目录：{args['src']} → {args['dst']}"
 
@@ -99,14 +103,14 @@ def rename_dir(args: dict, cwd: Path) -> str:
 def delete_dir(args: dict, cwd: Path) -> str:
     path = safe_resolve(cwd, args["path"])
     if not path.is_dir():
-        return f"错误：目录不存在：{args['path']}"
+        raise NotFoundError(f"目录不存在：{args['path']}")
     if path == cwd.resolve():
-        return "错误：禁止删除工作目录本身"
+        raise ToolPermissionError("禁止删除工作目录本身")
     if args.get("recursive"):
         shutil.rmtree(path)
         return f"已删除目录（递归）：{args['path']}"
     try:
         path.rmdir()
     except OSError:
-        return f"错误：目录非空，删除失败：{args['path']}；如需递归删除请设 recursive=true"
+        raise ValidationError(f"目录非空，删除失败：{args['path']}；如需递归删除请设 recursive=true")
     return f"已删除目录：{args['path']}"
