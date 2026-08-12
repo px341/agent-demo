@@ -26,6 +26,7 @@ from .contracts import (
     AgentRequest,
     AgentResponse,
     ApprovalGate,
+    CallOutcome,
     ContextComposer,
     LLMClient,
     LLMResponse,
@@ -44,9 +45,13 @@ def step_to_messages(step: StepRecord) -> list[Message]:
 
     与主循环发给 LLM 的轮内消息同构：
     - 工具轮：assistant 携带原生 tool_calls 声明（id 由模型返回），
-      每个工具结果以 role=tool + 对应 tool_call_id 回灌（OpenAI 兼容 API
-      要求 tool 消息必须配对前置 assistant 消息的 tool_calls 声明）；
+      每个声明都配一条 role=tool 消息（OpenAI 兼容 API 要求 tool 消息
+      必须配对前置 assistant 消息的 tool_calls 声明，缺配对会 400）。
+      未执行（skipped）的调用生成占位错误文本，保证无孤儿声明；
     - 最终答案轮：仅 assistant 消息（text 即答案）。
+
+    tool 消息把 error_type / partial 放进 metadata，供 memory 存档
+    结构化记录（archive.py 从 metadata 提取 error_type）。
     """
 
     if not step.tool_calls:
@@ -57,6 +62,34 @@ def step_to_messages(step: StepRecord) -> list[Message]:
                 metadata=dict(step.assistant_metadata),
             )
         ]
+
+    outcomes = step.outcomes or []
+    tool_messages: list[Message] = []
+    for index, call in enumerate(step.tool_calls):
+        call_id = (call or {}).get("id")
+        outcome = outcomes[index] if index < len(outcomes) else None
+        if outcome is not None:
+            observation = outcome.observation
+            metadata: dict = {}
+            if outcome.error_type:
+                metadata["error_type"] = outcome.error_type
+            if outcome.partial:
+                metadata["partial"] = True
+        else:
+            # 无 outcome（防御）：fallback 到 observations 或占位。
+            observations = step.observations
+            observation = (
+                observations[index] if index < len(observations) else ""
+            )
+            metadata = {}
+        tool_messages.append(
+            Message(
+                role="tool",
+                content=observation or "",
+                tool_call_id=call_id,
+                metadata=metadata,
+            )
+        )
     return [
         Message(
             role="assistant",
@@ -64,14 +97,7 @@ def step_to_messages(step: StepRecord) -> list[Message]:
             metadata=dict(step.assistant_metadata),
             tool_calls=list(step.tool_calls),
         ),
-        *[
-            Message(
-                role="tool",
-                content=observation or "",
-                tool_call_id=call.get("id"),
-            )
-            for call, observation in zip(step.tool_calls, step.observations)
-        ],
+        *tool_messages,
     ]
 
 
@@ -217,24 +243,28 @@ class AgentLoop:
                 )
 
             # 工具轮：并行执行全部调用（审批用批量闸门）。
-            calls: list[tuple[str, dict]] = []
+            calls: list[tuple[str, str, dict]] = []
             for call in result.tool_calls:
+                call_id = (call or {}).get("id")
                 function = (call or {}).get("function") or {}
                 name = function.get("name")
                 try:
                     args = json.loads(function.get("arguments") or "{}")
                 except (json.JSONDecodeError, TypeError):
                     args = {}
-                calls.append((name, args))
+                calls.append((call_id, name, args))
 
-            observations, executed, fatal = self._execute_tool_batch(calls)
-            tool_calls += executed
+            observations, outcomes, fatal = self._execute_tool_batch(calls)
+            # 计数「实际分发到执行器的调用」：无工具场景不计入。
+            if self.tools is not None:
+                tool_calls += sum(1 for o in outcomes if o.status != "skipped")
 
             step = StepRecord(
                 turn=turn,
                 raw_output=result.text,
                 tool_calls=list(result.tool_calls),
                 observations=observations,
+                outcomes=outcomes,
                 assistant_metadata=result.metadata,
             )
             steps.append(step)
@@ -263,47 +293,121 @@ class AgentLoop:
             steps=steps,
         )
 
-    def _execute_tool_batch(self, calls: list[tuple[str, dict]]) -> tuple[list[str], int, str | None]:
-        """执行一批工具调用，返回 (观察结果列表, 实际执行数, 致命错误文本)。
+    def _execute_tool_batch(
+        self, calls: list[tuple[str, dict]]
+    ) -> tuple[list[str], list[CallOutcome], str | None]:
+        """执行一批工具调用，返回 (观察文本, 结构化结果, 致命错误文本)。
 
-        审批闸门存在时整批询问一次，拒绝 → ApprovalDenied（不可恢复）终止。
+        审批闸门存在时整批询问一次，拒绝 → 全部 skipped + ApprovalDenied（致命）。
         工具抛 ToolError：
-        - recoverable（Validation/NotFound）→ 转错误文本观察，继续循环；
-        - 不可恢复（Permission/Timeout/Execution/Approval）→ 返回致命错误，
-          由主循环终止本轮（观察文本仍用于会话记录）。
+        - recoverable（Validation/NotFound）→ 记 error outcome，继续循环；
+        - 不可恢复（Permission/Timeout/Execution/Approval）→ 记 error outcome，
+          整批终止：之前已成功的调用打 partial 标记，剩余调用记 skipped。
+
+        结构化结果 CallOutcome 供 memory 存档与 summary 消费：
+        错误带 error_type，部分执行带 partial=True。
         """
         if self.tools is None:
-            prefix = "错误：当前未启用工具，无法调用"
+            prefix = "ToolError[ExecutionError]: 当前未启用工具，无法调用"
+            outcomes = [
+                CallOutcome(
+                    tool_call_id=call_id,
+                    status="error",
+                    observation=f"{prefix} {name!r}；请直接给出最终答案。",
+                    error_type="ExecutionError",
+                )
+                for call_id, name, _ in calls
+            ]
             return (
-                [f"{prefix} {name!r}；请直接给出最终答案。" for name, _ in calls],
-                0,
+                [o.observation for o in outcomes],
+                outcomes,
                 None,
             )
 
         if self.approval_gate is not None and not self.approval_gate.request_batch(
-            calls
+            [(name, args) for _, name, args in calls]
         ):
             from .errors import ApprovalDenied
 
             message = str(ApprovalDenied("用户拒绝了这批工具调用"))
-            return (
-                [message for _ in calls],
-                0,
-                message,
-            )
+            outcomes = [
+                CallOutcome(
+                    tool_call_id=call_id,
+                    status="skipped",
+                    observation=message,
+                    error_type="ApprovalDenied",
+                )
+                for call_id, _, _ in calls
+            ]
+            return [o.observation for o in outcomes], outcomes, message
 
-        observations = []
-        for name, args in calls:
+        outcomes: list[CallOutcome] = []
+        for index, (call_id, name, args) in enumerate(calls):
             try:
-                observations.append(str(self.tools.execute(name, args)))
+                observation = str(self.tools.execute(name, args))
+                outcomes.append(
+                    CallOutcome(
+                        tool_call_id=call_id,
+                        status="success",
+                        observation=observation,
+                    )
+                )
             except ToolError as exc:
                 message = str(exc)
-                observations.append(message)
+                outcomes.append(
+                    CallOutcome(
+                        tool_call_id=call_id,
+                        status="error",
+                        observation=message,
+                        error_type=exc.error_type,
+                    )
+                )
                 if not exc.recoverable:
-                    # 不可恢复：记录本调用错误后立即终止整批。
-                    return observations, len(observations), message
+                    # 不可恢复：之前已成功的调用打 partial，剩余 skipped。
+                    for prior in outcomes:
+                        if prior.status == "success":
+                            prior.partial = True
+                    for _ in range(index + 1, len(calls)):
+                        outcomes.append(
+                            CallOutcome(
+                                tool_call_id=None,
+                                status="skipped",
+                                observation=(
+                                    "ToolError[ExecutionError]: 未执行"
+                                    "（批被后续致命错误中断）"
+                                ),
+                                error_type="ExecutionError",
+                            )
+                        )
+                    return (
+                        [o.observation for o in outcomes],
+                        outcomes,
+                        message,
+                    )
             except Exception as exc:
                 message = f"ToolError[ExecutionError]: 工具 {name} 执行失败：{exc}"
-                observations.append(message)
-                return observations, len(observations), message
-        return observations, len(calls), None
+                outcomes.append(
+                    CallOutcome(
+                        tool_call_id=None,
+                        status="error",
+                        observation=message,
+                        error_type="ExecutionError",
+                    )
+                )
+                for prior in outcomes:
+                    if prior.status == "success":
+                        prior.partial = True
+                for _ in range(index + 1, len(calls)):
+                    outcomes.append(
+                        CallOutcome(
+                            tool_call_id=None,
+                            status="skipped",
+                            observation=(
+                                "ToolError[ExecutionError]: 未执行"
+                                "（批被后续致命错误中断）"
+                            ),
+                            error_type="ExecutionError",
+                        )
+                    )
+                return [o.observation for o in outcomes], outcomes, message
+        return [o.observation for o in outcomes], outcomes, None

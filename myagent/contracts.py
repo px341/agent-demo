@@ -179,10 +179,32 @@ class StopReason(str, Enum):
 
 
 @dataclass(slots=True)
+class CallOutcome:
+    """一次工具调用的执行结果（结构化，供 memory / summary 消费）。"""
+
+    #: 本次调用在 assistant tool_calls 中的 id（与 tool 消息配对）。
+    tool_call_id: str | None = None
+
+    #: 执行状态：success（成功）/ error（抛 ToolError）/ skipped（未执行）。
+    status: str = "success"
+
+    #: 成功输出 / 错误文本 / 未执行占位文本。
+    observation: str = ""
+
+    #: ToolError 分类名（error_type），如 PermissionError / TimeoutError；
+    #: 成功或未执行时为 None。
+    error_type: str | None = None
+
+    #: 部分执行标记：本调用已成功生效，但整批因后续致命错误中断
+    #: （副作用留在工作区，跨会话需知悉）。
+    partial: bool = False
+
+
+@dataclass(slots=True)
 class StepRecord:
     """ReAct 一步的完整轨迹：模型原始输出、工具调用、观察结果。
 
-    供日志 / 调试 / 审计使用，不参与模型推理。
+    供日志 / 调试 / 审计 / 记忆使用，不参与模型推理。
     """
 
     #: 从 1 开始的推理轮数。
@@ -199,6 +221,9 @@ class StepRecord:
 
     #: 工具执行结果文本列表（与 tool_calls 一一对应）；无工具轮为空。
     observations: list[str] = field(default_factory=list)
+
+    #: 每次调用的结构化结果（与 tool_calls 一一对应，含错误类型 / 部分执行标记）。
+    outcomes: list[CallOutcome] = field(default_factory=list)
 
     #: 本轮 assistant 消息的附加元数据（如 reasoning_content），
     #: 历史重建时随 assistant 消息回传。

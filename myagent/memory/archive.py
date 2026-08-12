@@ -87,7 +87,11 @@ def _redact_value(value: Any) -> Any:
 
 
 def _message_to_record(message: Message) -> dict[str, Any]:
-    """Message → 存档 dict（脱敏后）；tool_calls 里嵌的 JSON 字符串一并清洗。"""
+    """Message → 存档 dict（脱敏后）；tool_calls 里嵌的 JSON 字符串一并清洗。
+
+    tool 消息额外记录结构化错误信息（来自 step_to_messages 写入的
+    metadata.error_type），供 summary 重点记录错误。
+    """
     record: dict[str, Any] = {
         "ts": datetime.now().strftime(TS_FORMAT),
         "role": message.role,
@@ -100,6 +104,11 @@ def _message_to_record(message: Message) -> dict[str, Any]:
         record["tool_call_id"] = message.tool_call_id
     if message.metadata:
         record["metadata"] = _redact_value(message.metadata)
+        error_type = message.metadata.get("error_type")
+        if error_type:
+            record["error_type"] = error_type
+        if message.metadata.get("partial"):
+            record["partial"] = True
     return record
 
 

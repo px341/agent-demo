@@ -71,12 +71,29 @@ def _strip_code_fence(text: str) -> str:
 
 
 def render_transcript(records: list[dict[str, Any]]) -> str:
-    """把存档记录渲染为紧凑对话文本（供 LLM 提取摘要）。"""
+    """把存档记录渲染为紧凑对话文本（供 LLM 提取摘要）。
+
+    工具错误与部分执行（任务中断）有专门标记，便于模型重点提取：
+    - content 含 ``ToolError[`` 的 tool 记录 → ``→ 工具错误[类型]：...``
+      （错误信息是记忆重点，截断放宽到 800 字符）；
+    - metadata.partial 的记录 → ``→ 工具结果（部分执行，任务中断）：...``。
+    """
     lines: list[str] = []
     for record in records:
         role = record.get("role", "?")
         if role == "tool":
-            lines.append(f"→ 工具结果：{(record.get('content') or '')[:500]}")
+            content = record.get("content") or ""
+            error_type = record.get("error_type")
+            if error_type or content.startswith("ToolError["):
+                prefix = f"→ 工具错误[{error_type or '?'}]："
+                body = content[:800]
+            elif record.get("partial"):
+                prefix = "→ 工具结果（部分执行，任务中断）："
+                body = content[:800]
+            else:
+                prefix = "→ 工具结果："
+                body = content[:500]
+            lines.append(prefix + body)
             continue
         if role == "assistant" and record.get("tool_calls"):
             for call in record.get("tool_calls") or []:

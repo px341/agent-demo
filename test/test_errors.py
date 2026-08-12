@@ -314,5 +314,189 @@ class ComposerErrorCompatTest(unittest.TestCase):
         self.assertIn("PermissionError", tool_msgs[0].content)
 
 
+class MixedBatchPartialTest(unittest.TestCase):
+    """混合批 [成功, 致命错误, 未执行]：partial 标记 + 无孤儿声明。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_mixed_batch_marks_partial_and_skipped(self):
+        """[write_file(成功), delete_file(权限错), 未执行] → 3 outcomes。"""
+        from myagent.tools.registry import register_tool
+
+        # 注册一个会抛 PermissionError 的工具，插入批中间。
+        @register_tool("_fatal_tool")
+        def _fatal(args, cwd):
+            from myagent.errors import ToolPermissionError
+
+            raise ToolPermissionError("越界")
+
+        try:
+            tools = ToolExecutor(self.root)
+            llm = FakeLLM(
+                [
+                    LLMResponse(
+                        text="",
+                        tool_calls=[
+                            tc("write_file", {"path": "a.txt", "content": "x"}, "call_1"),
+                            tc("_fatal_tool", {}, "call_2"),
+                            tc("write_file", {"path": "b.txt", "content": "y"}, "call_3"),
+                        ],
+                    ),
+                    "不应被用到",
+                ]
+            )
+            loop = AgentLoop(AgentParams(cwd=str(self.root)), llm=llm, tools=tools)
+            resp = loop.run(AgentRequest(user_input="任务"))
+
+            self.assertEqual(resp.stop_reason, StopReason.TOOL_ERROR)
+            step = resp.steps[0]
+            outcomes = step.outcomes
+            self.assertEqual(len(outcomes), 3)
+            # 1) 成功 → partial（批被后续致命错误中断）
+            self.assertEqual(outcomes[0].status, "success")
+            self.assertTrue(outcomes[0].partial)
+            # 2) 致命错误 → error，带类型
+            self.assertEqual(outcomes[1].status, "error")
+            self.assertEqual(outcomes[1].error_type, "PermissionError")
+            # 3) 未执行 → skipped
+            self.assertEqual(outcomes[2].status, "skipped")
+            self.assertIn("未执行", outcomes[2].observation)
+            # 文件 a.txt 已成功写入（副作用保留）。
+            self.assertTrue((self.root / "a.txt").is_file())
+            self.assertFalse((self.root / "b.txt").exists())
+        finally:
+            from myagent.tools import TOOLS
+
+            del TOOLS["_fatal_tool"]
+
+    def test_no_orphan_tool_calls_in_rebuilt(self):
+        """混合批重建消息：每个声明都有配对 tool 消息，无孤儿。"""
+        from myagent.tools.registry import register_tool
+
+        @register_tool("_fatal_tool")
+        def _fatal(args, cwd):
+            from myagent.errors import ToolPermissionError
+
+            raise ToolPermissionError("越界")
+
+        try:
+            tools = ToolExecutor(self.root)
+            llm = FakeLLM(
+                [
+                    LLMResponse(
+                        text="",
+                        tool_calls=[
+                            tc("write_file", {"path": "a.txt", "content": "x"}, "call_1"),
+                            tc("_fatal_tool", {}, "call_2"),
+                            tc("write_file", {"path": "b.txt", "content": "y"}, "call_3"),
+                        ],
+                    ),
+                    "x",
+                ]
+            )
+            loop = AgentLoop(AgentParams(cwd=str(self.root)), llm=llm, tools=tools)
+            resp = loop.run(AgentRequest(user_input="任务"))
+            self.assertEqual(resp.stop_reason, StopReason.TOOL_ERROR)
+
+            rebuilt = step_to_messages(resp.steps[0])
+            # assistant 声明 3 个，tool 消息必须也是 3 条（配对无孤儿）。
+            assistant = rebuilt[0]
+            self.assertEqual(len(assistant.tool_calls), 3)
+            tool_msgs = [m for m in rebuilt if m.role == "tool"]
+            self.assertEqual(len(tool_msgs), 3)
+            self.assertEqual(
+                [m.tool_call_id for m in tool_msgs],
+                ["call_1", "call_2", "call_3"],
+            )
+            # 成功/部分执行消息带 partial 元数据；错误带 error_type。
+            self.assertTrue(tool_msgs[0].metadata.get("partial"))
+            self.assertEqual(tool_msgs[1].metadata.get("error_type"), "PermissionError")
+            self.assertIn("未执行", tool_msgs[2].content)
+        finally:
+            from myagent.tools import TOOLS
+
+            del TOOLS["_fatal_tool"]
+
+    def test_partial_flag_in_memory_archive(self):
+        """partial / error_type 结构化落盘 jsonl。"""
+        from myagent.tools.registry import register_tool
+
+        @register_tool("_fatal_tool")
+        def _fatal(args, cwd):
+            from myagent.errors import ToolPermissionError
+
+            raise ToolPermissionError("越界")
+
+        try:
+            memory_dir = self.root / "memories"
+            tools = ToolExecutor(self.root)
+            llm = FakeLLM(
+                [
+                    LLMResponse(
+                        text="",
+                        tool_calls=[
+                            tc("write_file", {"path": "a.txt", "content": "x"}, "call_1"),
+                            tc("_fatal_tool", {}, "call_2"),
+                        ],
+                    ),
+                    "x",
+                ]
+            )
+            loop = AgentLoop(AgentParams(cwd=str(self.root)), llm=llm, tools=tools)
+            resp = loop.run(AgentRequest(user_input="任务"))
+            self.assertEqual(resp.stop_reason, StopReason.TOOL_ERROR)
+
+            from myagent.memory import MemoryManager
+
+            mgr = MemoryManager(memory_dir=memory_dir, llm=None, session_id="session_mix")
+            for message in step_to_messages(resp.steps[0]):
+                mgr.append_message(message)
+            records = read_archive(memory_dir, "session_mix")
+            tool_records = [r for r in records if r["role"] == "tool"]
+            # 第一条（partial 成功）带 partial；第二条（致命）带 error_type。
+            self.assertTrue(tool_records[0].get("partial"))
+            self.assertEqual(tool_records[1].get("error_type"), "PermissionError")
+        finally:
+            from myagent.tools import TOOLS
+
+            del TOOLS["_fatal_tool"]
+
+
+class ErrorRenderingTest(unittest.TestCase):
+    """summary 渲染与 prompt：错误重点记录。"""
+
+    def test_render_transcript_error_and_partial(self):
+        from myagent.memory.summarizer import render_transcript
+
+        records = [
+            {"role": "tool", "content": "ToolError[NotFoundError]: 文件不存在：a.py", "error_type": "NotFoundError"},
+            {"role": "tool", "content": "已写入 a.txt", "partial": True},
+            {"role": "tool", "content": "ToolError[ApprovalDenied]: 用户拒绝", "error_type": "ApprovalDenied"},
+            {"role": "tool", "content": "普通结果"},
+        ]
+        text = render_transcript(records)
+        self.assertIn("→ 工具错误[NotFoundError]：", text)
+        self.assertIn("→ 工具结果（部分执行，任务中断）：已写入 a.txt", text)
+        self.assertIn("→ 工具错误[ApprovalDenied]：", text)
+        self.assertIn("→ 工具结果：普通结果", text)
+
+    def test_extract_prompt_emphasizes_errors(self):
+        """summary_extract_prompt.md 必须包含错误重点规则。"""
+        from myagent.agent_config import PROMPT_DIR
+
+        prompt = (PROMPT_DIR / "summary_extract_prompt.md").read_text(encoding="utf-8")
+        self.assertIn("工具错误必须重点记录", prompt)
+        self.assertIn("部分执行 / 任务中断必须记录", prompt)
+
+    def test_aggregate_prompt_prioritizes_errors(self):
+        from myagent.agent_config import PROMPT_DIR
+
+        prompt = (PROMPT_DIR / "summary_aggregate_prompt.md").read_text(encoding="utf-8")
+        self.assertIn("错误经验优先保留", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
