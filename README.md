@@ -28,6 +28,7 @@ python -m myagent            # 交互式多轮 REPL
 python -m myagent --one_shot # 一次性 ReAct 任务
 python -m myagent --cwd DIR  # 指定工作目录
 python -m myagent --no_memory # 不启用记忆（不存档、不注入跨会话记忆）
+python -m myagent --no_compose # 不启用上下文压缩（不裁剪 tool 输出、不丢弃历史）
 ```
 
 REPL 内建命令：`/exit`、`/quit`。
@@ -49,6 +50,7 @@ REPL 内建命令：`/exit`、`/quit`。
 | `actions.py` | 模型输出解析为 `ToolCall` / `FinalAnswer` / `Retry` |
 | `tools/` | 工具注册表与执行器（`read_file` / `list_files` 等 10 个，装饰器注册扩展） |
 | `memory/` | 记忆系统：会话 jsonl 存档、脱敏、水位线摘要、跨会话注入（`MemoryManager`） |
+| `context/` | 上下文压缩：三部分预算管理（system+memory / 本轮 session / 用户输入） |
 | `prompts/` | 系统提示词（工具 / 环境 / one_shot / 摘要提取 / 摘要聚合） |
 
 ## 主循环流程
@@ -66,7 +68,8 @@ REPL 内建命令：`/exit`、`/quit`。
 
 ## 关键设计
 
-- **契约与依赖注入分离**：`contracts.py` 定义 `LLMClient`（必需）、`ToolExecutor` / `MemoryStore`（可选）三个 Protocol，主循环不感知具体实现；工具、记忆各自接入。
+- **契约与依赖注入分离**：`contracts.py` 定义 `LLMClient`（必需）、`ToolExecutor` / `MemoryStore` / `ContextComposer`（可选）Protocol，主循环不感知具体实现；工具、记忆、上下文压缩各自接入。
+- **上下文压缩（context/）**：每次请求的输入分三部分预算——用户输入不可压缩；tool 输出单条超限裁剪为开头+结尾各半、总量超限丢弃最早结果（保留最新一对）；整体仍超则丢弃最早非 tool 消息。tool 消息与其 assistant 声明成对处理，绝不留下孤儿消息，预算充足时零改动。
 - **轮数与工具计数分离**：`attempts`（模型调用次数）与 `tool_calls`（实际工具调用次数）分别统计，格式错误的输出只消耗重试轮。
 - **DeepSeek thinking mode 兼容**：`reasoning_content` 提取进 metadata，随 assistant 消息原样回传，否则真实端点返回 400。
 - **多轮历史由调用方持有**：`AgentLoop` 每次只处理一个请求，不修改调用方传入的历史；REPL 层用 `step_to_messages` 从轨迹重建历史。
@@ -75,4 +78,5 @@ REPL 内建命令：`/exit`、`/quit`。
 
 - 工具（10 个：文件/目录读写改删）已接入 CLI，read 免询问、write/delete 走审批闸门；
 - 记忆系统已接入：REPL 每轮存档会话原文（脱敏），退出标记会话；下次启动 `sweep()` 按水位线汇总单会话摘要、聚合写 `memories/summary.md`，作为「跨会话记忆」注入 system prompt（默认 4000 字符截断）。`--no_memory` 可禁用；
-- 尚未做：REPL 多轮历史的 token 裁剪（长会话会无限膨胀）、one_shot 纯文本模式的记忆注入。
+- 上下文压缩已接入：默认启用，按预算压缩输入（tool 单条裁剪 + 总量丢弃 + 非 tool 丢弃）；`--no_compose` 可禁用。`max_input_tokens` 由此生效；
+- 尚未做：one_shot 纯文本模式的记忆注入。

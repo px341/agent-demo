@@ -21,6 +21,7 @@ from .contracts import (
     AgentRequest,
     AgentResponse,
     ApprovalGate,
+    ContextComposer,
     LLMClient,
     LLMResponse,
     MemoryStore,
@@ -105,12 +106,14 @@ class AgentLoop:
         llm: LLMClient,
         tools: ToolExecutor | None = None,
         memory: MemoryStore | None = None,
+        composer: ContextComposer | None = None,
         approval_gate: ApprovalGate | None = None,
     ):
         self.agent_params = agent_params
         self.llm = llm
         self.tools = tools
         self.memory = memory
+        self.composer = composer
         self.approval_gate = approval_gate
         self.cwd = Path(agent_params.cwd).resolve()
         self.system_prompt = self._load_system_prompt()
@@ -173,18 +176,29 @@ class AgentLoop:
         max_turns = max(1, max_turns)
 
         # 本次请求的消息上下文：系统提示（环境 + 工具） + 会话历史 + 当前请求。
-        # 不修改调用方传入的历史（extend 的是新列表）。
-        messages: list[Message] = [
-            Message(role="system", content=self._build_context_prompt())
-        ]
-        if request.messages:
-            messages.extend(request.messages)
-        messages.append(Message(role="user", content=request.user_input))
+        # 不修改调用方传入的历史；注入 composer 时由它按预算压缩三部分，
+        # 未注入则原样拼接。
+        system = self._build_context_prompt()
+        if self.composer is not None:
+            messages = self.composer.compose(
+                system, list(request.messages or []), request.user_input
+            )
+        else:
+            messages = [Message(role="system", content=system)]
+            if request.messages:
+                messages.extend(request.messages)
+            messages.append(Message(role="user", content=request.user_input))
 
         steps: list[StepRecord] = []
         tool_calls = 0
 
         for turn in range(1, max_turns + 1):
+            # 每轮发给 LLM 前压缩当前消息列表：tool 结果是轮内 append 进来的，
+            # 若不每轮压缩，单条 tool 输出与总量限制会被绕过。
+            if self.composer is not None:
+                messages = self.composer.recompress(
+                    messages, request.user_input
+                )
             try:
                 result: LLMResponse = self.llm.complete(
                     messages,

@@ -37,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="不启用记忆：不存档会话原文、不注入跨会话记忆",
     )
+    parser.add_argument(
+        "--no_compose",
+        action="store_true",
+        help="不启用上下文压缩：不裁剪 tool 输出、不丢弃历史",
+    )
     # 后续要加的其他参数在这里 add_argument(...)
     return parser
 

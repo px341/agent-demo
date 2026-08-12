@@ -4,10 +4,10 @@
 
 - 输入契约：AgentRequest —— 一次任务请求；
 - 返回值契约：AgentResponse / StepRecord / StopReason —— 一次请求的最终结果；
-- 依赖接口：LLMClient（必需）、ToolExecutor / MemoryStore（可选注入）。
+- 依赖接口：LLMClient（必需）、ToolExecutor / MemoryStore / ContextComposer（可选注入）。
 
-工具执行、记忆的具体实现后续分别放入 tools 包 / memory 包，
-只要满足对应 Protocol 即可接入，主循环代码无需改动。
+工具执行、记忆、上下文压缩的具体实现分别放入 tools 包 / memory 包 /
+context 包，只要满足对应 Protocol 即可接入，主循环代码无需改动。
 """
 from __future__ import annotations
 
@@ -90,6 +90,33 @@ class MemoryStore(Protocol):
 
     def sweep(self) -> None:
         """扫描全部会话存档，按水位线汇总单会话摘要并重写跨会话 summary.md。"""
+
+
+class ContextComposer(Protocol):
+    """上下文压缩器（可选依赖；None 表示不压缩）。
+
+    实现见 myagent.context 包（ContextComposer）。主循环在组装完
+    system prompt 后调用 ``compose``，由实现按三部分预算压缩：
+    - Part 1：system（prompt + 跨会话 memory）；
+    - Part 2：本轮会话历史（tool 输出单条裁剪 + 总量丢弃，非 tool 强压缩）；
+    - Part 3：用户输入不可压缩。
+
+    实现不修改入参；返回全新消息列表。实现示例：:
+
+        from myagent.context import ContextComposer
+        composer = ContextComposer(
+            max_input_tokens=params.max_input_tokens,
+            max_output_tokens=params.max_output_tokens,
+        )
+        loop = AgentLoop(params, llm=client, composer=composer)
+    """
+
+    def compose(
+        self,
+        system_prompt: str,
+        history: list[Message],
+        user_input: str,
+    ) -> list[Message]: ...
 
 
 class ApprovalGate(Protocol):

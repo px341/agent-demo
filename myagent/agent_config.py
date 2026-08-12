@@ -39,6 +39,12 @@ class AgentParams:
     # 最大轮数：用于限制消息的最大轮数，默认为 15。
     max_turns: int = 15
 
+    # 上下文压缩：单条 tool 输出的 token 上限（超出裁剪为开头+结尾各半）。
+    max_tool_tokens: int = 4000
+
+    # 上下文压缩：历史中所有 tool 输出的总 token 上限（超出丢弃最早结果）。
+    max_total_tool_tokens: int = 30000
+
     # 对话历史存储目录：本地永久化保存对话的文件夹路径，默认为 STORAGE_DIR。
     storage_dir: str = STORAGE_DIR
 

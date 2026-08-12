@@ -12,6 +12,7 @@ from .agent_config import AgentParams, Message
 from .agent_loop import AgentLoop, step_to_messages
 from .approval import ConsoleApprovalGate
 from .argparse import parse_args
+from .context import ContextComposer
 from .contracts import AgentRequest, AgentResponse, StopReason
 from .memory import MemoryManager
 from .provider import OpenAICompatibleModelClient
@@ -60,12 +61,24 @@ def main() -> int:
     if not args.no_memory:
         memory = MemoryManager(memory_dir=agent_params.memory_dir, llm=client)
 
+    # 上下文压缩：--no_compose 禁用；否则按预算压缩输入上下文
+    # （system+memory / 本轮 session / 用户输入）。
+    composer = None
+    if not args.no_compose:
+        composer = ContextComposer(
+            max_input_tokens=agent_params.max_input_tokens,
+            max_output_tokens=agent_params.max_output_tokens,
+            max_tool_tokens=agent_params.max_tool_tokens,
+            max_total_tool_tokens=agent_params.max_total_tool_tokens,
+        )
+
     loop = AgentLoop(
         agent_params,
         llm=client,
         tools=ToolExecutor(agent_params.cwd),
         approval_gate=ConsoleApprovalGate(),
         memory=memory,
+        composer=composer,
     )
 
     # 两种模式：--one_shot 调用一次；否则进入交互式多轮。
