@@ -6,8 +6,8 @@
 - 返回值契约：AgentResponse / StepRecord / StopReason —— 一次请求的最终结果；
 - 依赖接口：LLMClient（必需）、ToolExecutor / MemoryStore（可选注入）。
 
-工具执行、记忆、上下文压缩的具体实现后续分别放入 tools.py / memory 模块 /
-context_manager.py，只要满足对应 Protocol 即可接入，主循环代码无需改动。
+工具执行、记忆的具体实现后续分别放入 tools 包 / memory 包，
+只要满足对应 Protocol 即可接入，主循环代码无需改动。
 """
 from __future__ import annotations
 
@@ -63,11 +63,33 @@ class ToolExecutor(Protocol):
 
 
 class MemoryStore(Protocol):
-    """记忆读写（可选依赖；解耦接缝，具体实现后续加入）。"""
+    """会话记忆（可选依赖；None 表示不启用记忆）。
 
-    def retrieve(self, query: str) -> list[str]: ...
+    实现见 myagent.memory 包（MemoryManager）。主循环只读取注入用的
+    ``context_block()``；其余方法是供调用方（REPL 层）在会话生命周期
+    内调用：每轮消息追加存档、会话结束标记、下次启动统一扫描汇总。
 
-    def store(self, entry: str) -> None: ...
+    实现示例：:
+
+        from myagent.memory import MemoryManager
+        memory = MemoryManager(memory_dir=params.memory_dir)
+        loop = AgentLoop(params, llm=client, memory=memory)
+    """
+
+    #: 会话上下文唯一标识（JSONL 存档 / 状态文件名）。
+    session_id: str
+
+    def context_block(self, max_chars: int | None = None) -> str:
+        """返回注入 system prompt 的跨会话记忆文本；无记忆或空内容时返回 ""。"""
+
+    def append_message(self, message: Message) -> None:
+        """把一条会话消息（脱敏后）追加写入本次会话 JSONL 存档。"""
+
+    def close_session(self) -> None:
+        """标记本次会话为「可汇总」；实现应刷新存档并记录状态，不做 LLM 调用。"""
+
+    def sweep(self) -> None:
+        """扫描全部会话存档，按水位线汇总单会话摘要并重写跨会话 summary.md。"""
 
 
 class ApprovalGate(Protocol):

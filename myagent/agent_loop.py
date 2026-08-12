@@ -6,7 +6,8 @@
 - ``tools``：ToolExecutor（可选，None 表示未启用工具）；
 - ``memory``：MemoryStore（可选，None 表示未启用记忆）。
 
-工具执行、记忆、上下文压缩的具体实现后续各自接入，主循环不感知。
+工具执行、记忆的具体实现各自接入，主循环只感知注入接口：
+memory 的聚合摘要经 ``context_block()`` 前置进 system prompt。
 """
 from __future__ import annotations
 
@@ -115,17 +116,27 @@ class AgentLoop:
         self.system_prompt = self._load_system_prompt()
 
     def _build_context_prompt(self) -> str:
-        """拼接本次请求的系统提示：动态环境 prompt + 静态工具 prompt。
+        """拼接本次请求的系统提示：跨会话记忆 + 动态环境 prompt + 静态工具 prompt。
 
         每次 run 重新生成，保证 workspace tree 反映最新工作区状态。
+        记忆段仅在注入 MemoryStore 且聚合摘要非空时前置。
         """
+        memory_block = ""
+        if self.memory is not None:
+            memory_block = self.memory.context_block()
+
         environment = build_environment_prompt(
             self.agent_params.prompt_dir,
             self.cwd,
         )
-        if not environment:
+        parts = []
+        if memory_block:
+            parts.append(memory_block)
+        if environment:
+            parts.append(environment)
+        if not parts:
             return self.system_prompt
-        return environment + "\n\n" + self.system_prompt
+        return "\n\n".join(parts) + "\n\n" + self.system_prompt
 
     def _load_system_prompt(self) -> str:
         """从 prompt_dir 加载系统提示词；文件缺失时回退默认提示词。

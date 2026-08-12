@@ -14,3 +14,7 @@ architecture.md
 .reasonix
 *reasonix
 reasonix*
+.zcode
+
+# Session memory archives
+memories/

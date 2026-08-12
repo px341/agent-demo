@@ -12,6 +12,7 @@ from typing import Any, Literal
 BASE_DIR = Path(__file__).resolve().parent.parent
 STORAGE_DIR = BASE_DIR / ".storage"
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
+MEMORY_DIR = BASE_DIR / "memories"
 
 
 @dataclass(frozen=False, slots=True)
@@ -40,6 +41,9 @@ class AgentParams:
 
     # 对话历史存储目录：本地永久化保存对话的文件夹路径，默认为 STORAGE_DIR。
     storage_dir: str = STORAGE_DIR
+
+    # 记忆存档目录：会话原文 jsonl + 摘要 + .state 水位线；空串表示不启用记忆。
+    memory_dir: str = MEMORY_DIR
 
     # system_prompt 的路径
     prompt_dir: str = PROMPT_DIR

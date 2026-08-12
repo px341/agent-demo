@@ -27,6 +27,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 python -m myagent            # 交互式多轮 REPL
 python -m myagent --one_shot # 一次性 ReAct 任务
 python -m myagent --cwd DIR  # 指定工作目录
+python -m myagent --no_memory # 不启用记忆（不存档、不注入跨会话记忆）
 ```
 
 REPL 内建命令：`/exit`、`/quit`。
@@ -44,11 +45,11 @@ REPL 内建命令：`/exit`、`/quit`。
 | `api_config.py` | LLM 生成参数与默认 system prompt |
 | `provider.py` | DeepSeek 客户端；透传 `reasoning_content` metadata，防多轮 400 |
 | `contracts.py` | 主循环输入/输出契约 + 依赖注入 Protocol |
-| `agent_loop.py` | ReAct 主循环；轨迹记录；`step_to_messages` 消息重建 |
+| `agent_loop.py` | ReAct 主循环；轨迹记录；`step_to_messages` 消息重建；注入记忆段 |
 | `actions.py` | 模型输出解析为 `ToolCall` / `FinalAnswer` / `Retry` |
-| `tools.py` | 工具注册表与执行器（`read_file` / `list_files`，装饰器注册扩展） |
-| `context_manager.py` | token 裁剪 + `.storage/` 跨会话历史持久化（解耦接缝） |
-| `prompts/` | 系统提示词（`tools_system_prompt.md`、`planner_system_prompt.md`、`one_shot_system_prompt.md`） |
+| `tools/` | 工具注册表与执行器（`read_file` / `list_files` 等 10 个，装饰器注册扩展） |
+| `memory/` | 记忆系统：会话 jsonl 存档、脱敏、水位线摘要、跨会话注入（`MemoryManager`） |
+| `prompts/` | 系统提示词（工具 / 环境 / one_shot / 摘要提取 / 摘要聚合） |
 
 ## 主循环流程
 
@@ -65,13 +66,13 @@ REPL 内建命令：`/exit`、`/quit`。
 
 ## 关键设计
 
-- **契约与依赖注入分离**：`contracts.py` 定义 `LLMClient`（必需）、`ToolExecutor` / `MemoryStore`（可选）三个 Protocol，主循环不感知具体实现；工具、记忆后续各自接入即可。
+- **契约与依赖注入分离**：`contracts.py` 定义 `LLMClient`（必需）、`ToolExecutor` / `MemoryStore`（可选）三个 Protocol，主循环不感知具体实现；工具、记忆各自接入。
 - **轮数与工具计数分离**：`attempts`（模型调用次数）与 `tool_calls`（实际工具调用次数）分别统计，格式错误的输出只消耗重试轮。
 - **DeepSeek thinking mode 兼容**：`reasoning_content` 提取进 metadata，随 assistant 消息原样回传，否则真实端点返回 400。
 - **多轮历史由调用方持有**：`AgentLoop` 每次只处理一个请求，不修改调用方传入的历史；REPL 层用 `step_to_messages` 从轨迹重建历史。
 
 ## 现状与待办
 
-- 工具仅注册了 `read_file`、`list_files`，尚未接入 CLI（`cli.py` 建 `AgentLoop` 时未注入 tools）；
-- `context_manager.py`（token 裁剪 + 历史持久化）与 `MemoryStore` 记忆为解耦接缝，未接入主链；
-- 详细流程图见 `architecture.md`。
+- 工具（10 个：文件/目录读写改删）已接入 CLI，read 免询问、write/delete 走审批闸门；
+- 记忆系统已接入：REPL 每轮存档会话原文（脱敏），退出标记会话；下次启动 `sweep()` 按水位线汇总单会话摘要、聚合写 `memories/summary.md`，作为「跨会话记忆」注入 system prompt（默认 4000 字符截断）。`--no_memory` 可禁用；
+- 尚未做：REPL 多轮历史的 token 裁剪（长会话会无限膨胀）、one_shot 纯文本模式的记忆注入。

@@ -26,6 +26,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="设置工作目录（默认当前目录）",
     )
+    parser.add_argument(
+        "--memory_dir",
+        default=None,
+        metavar="DIR",
+        help="记忆存档目录（默认 memories/，相对项目根）",
+    )
+    parser.add_argument(
+        "--no_memory",
+        action="store_true",
+        help="不启用记忆：不存档会话原文、不注入跨会话记忆",
+    )
     # 后续要加的其他参数在这里 add_argument(...)
     return parser
 
