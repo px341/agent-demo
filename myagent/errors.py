@@ -47,6 +47,17 @@ class NotFoundError(ToolError):
     recoverable = True
 
 
+class CommandError(ToolError):
+    """命令执行非零退出（如 pytest 失败、git 命令报错）。
+
+    可恢复：命令输出与退出码回灌给模型，由它决定是修正命令重试
+    还是基于输出继续推理（测试失败是正常反馈，不应终止任务）。
+    """
+
+    error_type = "CommandError"
+    recoverable = True
+
+
 class ToolPermissionError(ToolError):
     """权限不足 / 越界（如路径逃逸、禁止操作工作目录本身）。"""
 

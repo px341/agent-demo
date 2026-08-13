@@ -33,6 +33,10 @@ EXPECTED_TOOLS = {
     "write_dir",
     "rename_dir",
     "delete_dir",
+    "run_shell",
+    "git_status",
+    "git_diff",
+    "git_apply_patch",
 }
 
 
