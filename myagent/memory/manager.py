@@ -4,7 +4,8 @@
 
 - 会话原文逐条追加 ``memories/<sessionId>.jsonl``（脱敏后）；
 - 退出只打 ``status="closed"``（零 LLM 成本），下次启动 :meth:`sweep`
-  统一扫描：closed / failed 会话无条件处理，open 会话按 mtime 静止阈值
+  统一扫描：closed 会话按内容水位线（``archive_mtime`` vs mtime）判断是否
+  需要重新汇总，failed 会话在 retry 上限内重试，open 会话按 mtime 静止阈值
   兜底进程被杀的场景；
 - 幂等：``.state/<sessionId>.json`` 记录 ``archive_mtime`` 水位线，
   内容没变（mtime 相同且 status=done）不重提，不重复花 LLM 钱；
@@ -171,7 +172,11 @@ class MemoryManager:
             )
             return False
         if status == STATUS_CLOSED:
-            return True  # 无条件处理
+            # 内容驱动：仅当从未汇总过或存档有新增（mtime 变化）才重新处理。
+            # 不能「closed 无条件处理」——否则重新进入一个已结束的会话，
+            # 即使一句话没说（JSONL 内容未变），每次退出后 sweep 都会
+            # 重复调用 LLM 做 extract（会话可恢复场景的重复计费）。
+            return state.get("archive_mtime") != mtime
         # open 或无状态：mtime 静止超阈值才兜底处理（进程被杀场景）。
         if state.get("archive_mtime") is not None:
             return False

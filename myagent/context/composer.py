@@ -7,7 +7,10 @@
 - **Part 2（本轮 session history）** 压缩分两档：
   - **tool 独立预算（无条件执行，与整体预算正交）**：
     1. 单条 tool 输出超 ``max_tool_tokens`` → 裁剪为开头+结尾各半（保留原文，
-       只动 content 字符串，不改 assistant 的 tool_calls 声明与配对）；
+       只动 content 字符串，不改 assistant 的 tool_calls 声明与配对）。
+       例外：错误类 tool 输出（``ToolError`` 文本，工具层已截断）不裁剪——
+       是模型修正的关键回灌依据；含 unified diff 的输出（git\_diff）改用
+       ``clip_diff_hunks`` hunk 对齐裁剪——保完整 hunk 不被头尾切割切碎；
     2. tool 总 token 超 ``max_total_tool_tokens`` → 从最早工具组整组丢弃，
        保留最新一组；
   - **整体预算不足时**：
@@ -22,13 +25,41 @@ tool_calls 声明；消息相对顺序保持不变；不修改入参。
 from __future__ import annotations
 
 from ..agent_config import Message
-from .tokens import clip_head_tail, count_message_tokens, count_tokens, truncate_to_tokens
+from .tokens import (
+    clip_diff_hunks,
+    clip_head_tail,
+    count_message_tokens,
+    count_tokens,
+    truncate_to_tokens,
+)
 
 #: system prompt 中跨会话记忆段的固定标题（与 memory/manager.py 一致）。
 _MEMORY_MARKER = "## 跨会话记忆"
 
 #: 压缩后的标记文案。
 _CLIPPED_MARK = "…[已裁剪]"
+
+
+def _is_error_tool_message(message: Message) -> bool:
+    """错误类 tool 消息：不裁剪。
+
+    错误文本本身短（工具层已把错误输出截断到 2000 字符内），且是模型修正
+    参数/命令的关键回灌依据；头尾各半反而可能切掉关键的错误行号或命令。
+    """
+    if message.metadata.get("error_type"):
+        return True
+    return (message.content or "").startswith("ToolError[")
+
+
+def _is_diff_content(content: str | None) -> bool:
+    """unified diff 特征（git diff / git apply 的输出）。
+
+    含 ``diff --git`` 文件头或 ``@@`` hunk 头即视为 diff，改用
+    ``clip_diff_hunks`` hunk 对齐裁剪——保留完整 hunk，避免头尾切割把
+    patch 从中间切开（``@@`` 头变孤儿，模型看到拼不起来的碎片）。
+    """
+    text = content or ""
+    return "diff --git" in text or "@@ -" in text
 
 
 class ContextComposer:
@@ -161,14 +192,27 @@ class ContextComposer:
         """
         # 阶段 1：单条 tool 输出超限 → 裁剪为开头+结尾各半（只换 content，
         # 不动 assistant 的 tool_calls 声明与配对，否则真实端点 400）。
+        # 例外：
+        # - 错误类输出（ToolError 文本）不裁剪——本身短，且是模型修正的关键依据；
+        # - 含 unified diff 的输出（git_diff）改用 clip_diff_hunks hunk 对齐
+        #   裁剪，避免把完整 hunk 从中间切开（@@ 头变孤儿）。
         for i, m in enumerate(msgs):
-            if m.role == "tool" and count_tokens(m.content) > self.max_tool_tokens:
-                msgs[i] = Message(
-                    role="tool",
-                    content=clip_head_tail(m.content, self.max_tool_tokens),
-                    tool_call_id=m.tool_call_id,
-                    metadata=dict(m.metadata),
-                )
+            if m.role != "tool":
+                continue
+            if count_tokens(m.content) <= self.max_tool_tokens:
+                continue
+            if _is_error_tool_message(m):
+                continue
+            if _is_diff_content(m.content):
+                clipped = clip_diff_hunks(m.content, self.max_tool_tokens)
+            else:
+                clipped = clip_head_tail(m.content, self.max_tool_tokens)
+            msgs[i] = Message(
+                role="tool",
+                content=clipped,
+                tool_call_id=m.tool_call_id,
+                metadata=dict(m.metadata),
+            )
 
         # 阶段 2：tool 总量超限 → 从最早工具组整组丢弃，保留最新一组。
         while True:

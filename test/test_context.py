@@ -70,6 +70,25 @@ def tool_pair(prefix: str = "t1", obs: str = "结果") -> tuple[Message, Message
     return assistant, result
 
 
+def make_big_diff(num_hunks: int = 6) -> str:
+    """构造一个多 hunk 的 unified diff（同一文件头，每 hunk 含可识别首末行）。"""
+    blocks: list[str] = [
+        "diff --git a/a.py b/a.py",
+        "--- a/a.py",
+        "+++ b/a.py",
+    ]
+    for i in range(num_hunks):
+        blocks.extend(
+            [
+                f"@@ -{i*10},5 +{i*10},5 @@ hunk_{i}",
+                f"-old_{i}",
+                f"+new_{i}",
+                *(f"ctx_{i}_{j:03d}" for j in range(80)),
+            ]
+        )
+    return "\n".join(blocks)
+
+
 class TokensTest(unittest.TestCase):
     """token 计数与裁剪工具。"""
 
@@ -211,6 +230,48 @@ class ToolClippingTest(unittest.TestCase):
         self.assertEqual(
             assistant_msg.tool_calls[0]["function"]["name"], "read_file"
         )
+
+    def test_error_tool_output_not_clipped(self):
+        # 错误类 tool 输出（带 error_type metadata）是模型修正的关键依据：
+        # 即使超预算也原样保留，不裁剪头尾。
+        c = make_composer(max_tool_tokens=100, max_total_tool_tokens=1000)
+        err_text = "ToolError[PermissionError]: 路径越界（禁止访问工作目录之外）" + "细节" * 400
+        assistant, result = tool_pair("e", err_text)
+        result.metadata = {"error_type": "PermissionError"}
+        out = c.compose("s", [assistant, result], "u")
+        tool = [m for m in out if m.role == "tool"][0]
+        self.assertEqual(tool.content, err_text)
+
+    def test_error_tool_output_not_clipped_by_content_prefix(self):
+        # 无 metadata 时，按 content 前缀 ToolError[ 识别（与摘要渲染同一判据）。
+        c = make_composer(max_tool_tokens=100, max_total_tool_tokens=1000)
+        err_text = "ToolError[TimeoutError]: 命令执行超过 30 秒" + "x" * 500
+        assistant, result = tool_pair("e2", err_text)
+        out = c.compose("s", [assistant, result], "u")
+        tool = [m for m in out if m.role == "tool"][0]
+        self.assertEqual(tool.content, err_text)
+
+    def test_diff_output_clipped_by_hunks_kept_intact(self):
+        # git diff 输出超预算 → hunk 对齐裁剪：保留下来的每个 hunk 都完整
+        # （@@ 头 + 全部内容行），而不是头尾各半把 hunk 从中间切开。
+        c = make_composer(max_tool_tokens=600, max_total_tool_tokens=50000)
+        big = make_big_diff(6)
+        self.assertGreater(count_tokens(big), 600)
+        assistant, result = tool_pair("d", big)
+        out = c.compose("s", [assistant, result], "u")
+        tool = [m for m in out if m.role == "tool"][0]
+        self.assertIn("已裁剪", tool.content)
+        # 每个保留下来的 @@ hunk 头，其完整内容（含末行）必须都在——hunk 不被切碎。
+        kept = 0
+        for i in range(6):
+            if f"@@ -{i*10}" in tool.content:
+                kept += 1
+                self.assertIn(
+                    f"ctx_{i}_079", tool.content,
+                    f"hunk {i} 被从中间切开（头在但内容不完整）",
+                )
+        self.assertGreaterEqual(kept, 1)
+        self.assertLess(kept, 6)  # 预算有限，必有 hunk 被裁剪掉
 
 
 class ToolBudgetDropTest(unittest.TestCase):

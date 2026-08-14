@@ -380,6 +380,40 @@ class SweepStateMachineTest(unittest.TestCase):
         self.assertEqual(len(llm.calls), 4)
         self.assertEqual(mgr._load_state(mgr.session_id)["status"], STATUS_DONE)
 
+    def test_reopen_closed_session_without_new_content_skips_llm(self):
+        """空重入：已结束的会话被重新进入又退出（不追加消息），不重复计费。
+
+        closed 分支必须按 mtime 水位线判断，而不能无条件处理——否则
+        「会话可恢复」场景下，每次重新进入再退出都会重复调用 LLM
+        做 extract（内容没变，输出相同，钱照烧）。
+        """
+        llm = FakeLLM([
+            '{"rollout_summary": "s1", "raw_memory": "m1"}', "# 聚合",
+            '{"rollout_summary": "s1+", "raw_memory": "m2"}', "# 聚合2",
+        ])
+        mgr = self._ready_manager(llm=llm)
+        mgr.sweep()
+        self.assertEqual(len(llm.calls), 2)
+
+        # 模拟「重新进入旧会话」：close_session 只把 status 写回 closed，
+        # 不追加任何消息 → JSONL mtime 未变。
+        mgr.close_session()
+        self.assertEqual(mgr._load_state(mgr.session_id)["status"], STATUS_CLOSED)
+
+        mgr2 = make_manager(self.tmp, llm=llm, idle_threshold=0)
+        mgr2.session_id = mgr.session_id
+        mgr2.sweep()
+        # 内容未变 → 跳过，零新增调用。
+        self.assertEqual(len(llm.calls), 2)
+
+        # 但若重新进入后确实说了话（mtime 变化），内容驱动仍应重新汇总。
+        mgr.append_message(Message(role="user", content="我又回来了"))
+        mgr.close_session()
+        mgr3 = make_manager(self.tmp, llm=llm, idle_threshold=0)
+        mgr3.session_id = mgr.session_id
+        mgr3.sweep()
+        self.assertEqual(len(llm.calls), 4)
+
     def test_open_idle_session_processed(self):
         llm = FakeLLM(['{"rollout_summary": "s", "raw_memory": "m"}', "# 聚合"])
         mgr = make_manager(self.tmp, llm=llm, idle_threshold=100000)
