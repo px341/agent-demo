@@ -105,7 +105,10 @@ REPL 内建命令：`/exit`、`/quit`。
   `ToolExecutor`（`tool_names=read_only_tool_names()`）双保险，模型即使
   幻想调用写工具也会被拒绝（`ValidationError` 回灌，可恢复）。需要改动时
   工人把建议整理为 unified diff 附在 `DONE:` 结论里，由编排者统一
-  `git_apply_patch` 裁决落盘——多个工人永远不写同一文件，冲突交给 git；
+  `git_apply_patch` 裁决落盘——多个工人永远不写同一文件，冲突交给 git。
+  **边界说明**：工人侧"永不写"是硬保证；编排者侧**不承诺"收尾才写"**——
+  它是单线程串行 + 审批闸门 + git 兜底，收到 patch 可随时 apply，也可
+  边委派边改（有意的灵活性，无并发写冲突）。
 - **工人失败隔离**：工人超轮数 / 出错只表现为 `FAILED:` 观察（含原因与轨迹
   节选），不打断编排者；
 - **防递归委派**：工人 schema 不含 `delegate_agent`，嵌套委派被禁止；
