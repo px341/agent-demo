@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any, Callable
 
 from .agent_config import AgentParams, Message
 from .api_config import DEFAULT_SYSTEM_PROMPT
@@ -123,6 +124,7 @@ class AgentLoop:
         memory: MemoryStore | None = None,
         composer: ContextComposer | None = None,
         approval_gate: ApprovalGate | None = None,
+        tools_schema: Callable[[], list[dict[str, Any]]] | None = None,
     ):
         self.agent_params = agent_params
         self.llm = llm
@@ -132,6 +134,9 @@ class AgentLoop:
         self.approval_gate = approval_gate
         self.cwd = Path(agent_params.cwd).resolve()
         self.system_prompt = self._load_system_prompt()
+        #: 每轮发给 LLM 的工具 schema 提供者；None 时用全局注册表全量渲染。
+        #: 多 agent 场景按角色裁剪（如工人不暴露 delegate_agent）时覆盖。
+        self._tools_schema = tools_schema or to_openai_tools
 
     def _build_context_prompt(self) -> str:
         """拼接本次请求的系统提示：跨会话记忆 + 动态环境 prompt + 静态工具 prompt。
@@ -211,7 +216,7 @@ class AgentLoop:
             try:
                 result: LLMResponse = self.llm.complete(
                     messages,
-                    tools=to_openai_tools(),
+                    tools=self._tools_schema(),
                     max_new_tokens=self.agent_params.max_output_tokens,
                 )
             except Exception as exc:

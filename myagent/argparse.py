@@ -37,6 +37,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="不启用上下文压缩：不裁剪 tool 输出、不丢弃历史",
     )
+    parser.add_argument(
+        "--multi_agent",
+        action="store_true",
+        help="启用编排者-工人多 agent 模式（注入 delegate_agent 委派工具）",
+    )
+    parser.add_argument(
+        "--worker_prompt_dir",
+        default=None,
+        metavar="DIR",
+        help="工人提示词目录（默认与主 agent 相同 prompts/；角色模板 worker_<role>.md）",
+    )
+    parser.add_argument(
+        "--max_workers",
+        type=int,
+        default=4,
+        metavar="N",
+        help="工人并发上限（默认 4）",
+    )
     # 后续要加的其他参数在这里 add_argument(...)
     return parser
 

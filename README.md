@@ -28,13 +28,14 @@ python -m myagent            # 交互式多轮 REPL
 python -m myagent --cwd DIR  # 指定工作目录
 python -m myagent --no_memory # 不启用记忆（不存档、不注入跨会话记忆）
 python -m myagent --no_compose # 不启用上下文压缩（不裁剪 tool 输出、不丢弃历史）
+python -m myagent --multi_agent # 编排者-工人多 agent 模式（可配 --worker_prompt_dir / --max_workers）
 ```
 
 REPL 内建命令：`/exit`、`/quit`。
 
 ## 模块清单
 
-`myagent/` 共 10 个 Python 文件（约 1350 行），分层如下：
+`myagent/` 共 12 个顶层 Python 文件 + tools/context/memory/multi 四个子包（约 3800 行），分层如下：
 
 | 模块 | 职责 |
 |------|------|
@@ -50,7 +51,8 @@ REPL 内建命令：`/exit`、`/quit`。
 | `tools/` | 工具注册表与执行器（`read_file` / `list_files` 等 10 个，装饰器注册扩展） |
 | `memory/` | 记忆系统：会话 jsonl 存档、脱敏、水位线摘要、跨会话注入（`MemoryManager`） |
 | `context/` | 上下文压缩：三部分预算管理（system+memory / 本轮 session / 用户输入） |
-| `prompts/` | 系统提示词（工具 / 环境 / 摘要提取 / 摘要聚合） |
+| `multi/` | 多 agent：编排者-工人模式（`OrchestratorLoop` / `delegate_agent` 工具 / 工人提示词渲染） |
+| `prompts/` | 系统提示词（工具 / 环境 / 摘要提取 / 摘要聚合 / 工人 worker.md / 角色 worker_<role>.md） |
 
 ## 主循环流程
 
@@ -79,3 +81,33 @@ REPL 内建命令：`/exit`、`/quit`。
 - 记忆系统已接入：启动时自动汇总历史会话（`sweep()`，mtime 水位线幂等 + 失败重试），REPL 每轮存档会话原文（脱敏），退出标记会话；`memories/summary.md` 作为「跨会话记忆」注入 system prompt（默认 4000 字符截断）。`--no_memory` 可禁用；
 - 上下文压缩已接入：默认启用，按预算压缩输入（tool 单条裁剪 + 总量丢弃 + 非 tool 丢弃）；`--no_compose` 可禁用。`max_input_tokens` 由此生效；
 - REPL 历史有上限（默认 300 条消息），超出后配对安全裁剪，保证不产生孤儿消息。
+
+## 多 agent（编排者-工人，`--multi_agent`）
+
+核心思路：**编排者就是一个普通 `AgentLoop`**，只是额外注册了 `delegate_agent`
+工具；工人是后台线程里临时创建的另一个 `AgentLoop`（共享同一 LLM client 与
+工作目录/工具执行器），跑完一次子任务的完整 ReAct 后，把结果文本化为观察
+返回给编排者继续推理。主循环本身零改动。
+
+```text
+编排者 AgentLoop（完整装配：记忆/压缩/审批照常）
+  └─ delegate_agent 工具 → 后台线程 → 工人 AgentLoop（独立角色 prompt）
+        └─ 工人自己跑 ReAct（read_file / run_shell …）
+  ← DONE: <答案>  /  FAILED: <原因> 文本观察
+  └─ 编排者基于观察继续推理
+```
+
+- **上下文边界（只共享工作区 + 任务描述）**：工人用独立角色 prompt
+  （`prompts/worker.md`，或按 `role` 加载 `worker_<role>.md`，任务经 `{task}`
+  注入），不带编排者的会话历史与跨会话记忆；工人的轨迹不进入编排者历史；
+- **工人失败隔离**：工人超轮数 / 出错只表现为 `FAILED:` 观察（含原因与轨迹
+  节选），不打断编排者；
+- **防递归委派**：工人不可见 `delegate_agent`（`worker_tools_schema` 过滤），
+  嵌套委派在 schema 层即被禁止；
+- **免询问**：`delegate_agent` 标 `risk="read"`（委派本身不改工作区），
+  工人不带审批闸门（后台线程不能弹交互确认），写操作仍受 shell 黑名单兜底；
+- **并发**：委派经 `ThreadPoolExecutor(max_workers)` 限流，同一批并行调用
+  顺序执行（工人共享工作区，避免并发写竞态）。
+
+参数：`--multi_agent`（启用）、`--worker_prompt_dir`（工人提示词目录，默认与
+主 agent 同 `prompts/`）、`--max_workers`（并发上限，默认 4）。

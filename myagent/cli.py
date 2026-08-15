@@ -75,14 +75,33 @@ def main() -> int:
             max_total_tool_tokens=agent_params.max_total_tool_tokens,
         )
 
-    loop = AgentLoop(
-        agent_params,
-        llm=client,
-        tools=ToolExecutor(agent_params.cwd, timeout=agent_params.tool_timeout),
-        approval_gate=ConsoleApprovalGate(),
-        memory=memory,
-        composer=composer,
+    tools_executor = ToolExecutor(
+        agent_params.cwd, timeout=agent_params.tool_timeout
     )
+    if args.multi_agent:
+        # 编排者-工人模式：编排者是完整的主 loop（记忆/压缩/审批照常），
+        # 另注入 delegate_agent 委派工具；工人按角色提示词独立运行。
+        from .multi import build_orchestrator_loop
+
+        loop = build_orchestrator_loop(
+            agent_params=agent_params,
+            llm=client,
+            tools=tools_executor,
+            memory=memory,
+            composer=composer,
+            approval_gate=ConsoleApprovalGate(),
+            worker_prompt_dir=args.worker_prompt_dir,
+            max_workers=args.max_workers,
+        )
+    else:
+        loop = AgentLoop(
+            agent_params,
+            llm=client,
+            tools=tools_executor,
+            approval_gate=ConsoleApprovalGate(),
+            memory=memory,
+            composer=composer,
+        )
 
     return _repl(loop, memory)
 

@@ -24,15 +24,31 @@ from .registry import TOOLS, ToolSpec
 
 
 class ToolExecutor:
-    """带工作目录上下文的工具执行器。"""
+    """带工作目录上下文的工具执行器。
 
-    def __init__(self, cwd: str | Path, timeout: float | None = None):
+    ``tool_names`` 白名单（可选）：非 None 时只允许执行名单内的工具，
+    供多 agent 场景按角色裁剪工人能力（None 表示允许全部工具）。
+    """
+
+    def __init__(
+        self,
+        cwd: str | Path,
+        timeout: float | None = None,
+        tool_names: list[str] | None = None,
+    ):
         self.cwd = Path(cwd).resolve()
         #: 单次工具执行的超时秒数；None / <=0 表示不超时。
         self.timeout = timeout if timeout and timeout > 0 else None
+        #: 允许执行的工具名集合；None 表示不限制。
+        self.tool_names = set(tool_names) if tool_names is not None else None
 
     def execute(self, name: str, args: dict[str, Any]) -> str:
         """按名称执行工具；失败抛 ToolError 子类（未知异常包装为 ExecutionError）。"""
+        if self.tool_names is not None and name not in self.tool_names:
+            allowed = ", ".join(sorted(self.tool_names))
+            raise ValidationError(
+                f"工具 {name!r} 不在本执行器白名单中，允许：{allowed}"
+            )
         spec = TOOLS.get(name)
         if spec is None:
             available = ", ".join(list_tools())
