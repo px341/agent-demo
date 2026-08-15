@@ -100,14 +100,20 @@ REPL 内建命令：`/exit`、`/quit`。
 - **上下文边界（只共享工作区 + 任务描述）**：工人用独立角色 prompt
   （`prompts/worker.md`，或按 `role` 加载 `worker_<role>.md`，任务经 `{task}`
   注入），不带编排者的会话历史与跨会话记忆；工人的轨迹不进入编排者历史；
+- **写者归一（解决并发写冲突）**：工人**只有只读工具**——schema 层只渲染
+  `risk="read"` 工具（`worker_tools_schema`），executor 层用独立的白名单
+  `ToolExecutor`（`tool_names=read_only_tool_names()`）双保险，模型即使
+  幻想调用写工具也会被拒绝（`ValidationError` 回灌，可恢复）。需要改动时
+  工人把建议整理为 unified diff 附在 `DONE:` 结论里，由编排者统一
+  `git_apply_patch` 裁决落盘——多个工人永远不写同一文件，冲突交给 git；
 - **工人失败隔离**：工人超轮数 / 出错只表现为 `FAILED:` 观察（含原因与轨迹
   节选），不打断编排者；
-- **防递归委派**：工人不可见 `delegate_agent`（`worker_tools_schema` 过滤），
-  嵌套委派在 schema 层即被禁止；
+- **防递归委派**：工人 schema 不含 `delegate_agent`，嵌套委派被禁止；
 - **免询问**：`delegate_agent` 标 `risk="read"`（委派本身不改工作区），
-  工人不带审批闸门（后台线程不能弹交互确认），写操作仍受 shell 黑名单兜底；
-- **并发**：委派经 `ThreadPoolExecutor(max_workers)` 限流，同一批并行调用
-  顺序执行（工人共享工作区，避免并发写竞态）。
+  工人不带审批闸门（后台线程不能弹交互确认），写操作由只读白名单杜绝；
+- **并发**：委派经 `ThreadPoolExecutor(max_workers)` 限流；工人纯只读、
+  无共享可变状态，同一批委派先顺序执行（为后续并行铺路，池只约束
+  同时存活的工人数）。
 
 参数：`--multi_agent`（启用）、`--worker_prompt_dir`（工人提示词目录，默认与
 主 agent 同 `prompts/`）、`--max_workers`（并发上限，默认 4）。

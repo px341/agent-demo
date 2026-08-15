@@ -30,7 +30,7 @@ from myagent.multi import (
     unregister_worker_tool,
 )
 from myagent.multi.context import render_worker_prompt
-from myagent.multi.worker_tool import worker_tools_schema
+from myagent.multi.worker_tool import read_only_tool_names, worker_tools_schema
 from myagent.tools import ToolExecutor
 from myagent.tools.registry import TOOLS, to_openai_tools
 
@@ -93,11 +93,36 @@ class DelegateToolTest(unittest.TestCase):
         names = [t["function"]["name"] for t in to_openai_tools()]
         self.assertIn("delegate_agent", names)
 
-    def test_worker_schema_excludes_delegate(self):
-        """工人 schema 不含 delegate_agent：从源头防止嵌套委派。"""
+    def test_worker_schema_readonly_only(self):
+        """工人 schema 只含只读工具：无写工具、无 delegate_agent（写者归一）。"""
         names = [t["function"]["name"] for t in worker_tools_schema()]
         self.assertNotIn("delegate_agent", names)
-        self.assertIn("read_file", names)  # 其余工具照常可见
+        self.assertIn("read_file", names)
+        self.assertIn("git_diff", names)
+        for write_tool in (
+            "write_file", "edit_file", "delete_file",
+            "run_shell", "git_apply_patch", "create_dir",
+        ):
+            self.assertNotIn(write_tool, names)
+
+    def test_read_only_tool_names(self):
+        """只读集合：含读工具、不含写工具、不含 delegate_agent。"""
+        names = read_only_tool_names()
+        self.assertIn("read_file", names)
+        self.assertIn("list_files", names)
+        self.assertNotIn("write_file", names)
+        self.assertNotIn("run_shell", names)
+        self.assertNotIn("delegate_agent", names)
+
+    def test_worker_executor_denies_write(self):
+        """executor 层白名单强制：工人调写工具 → ValidationError（可恢复）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = ToolExecutor(tmp, tool_names=sorted(read_only_tool_names()))
+            with self.assertRaises(ValidationError):
+                executor.execute("write_file", {"path": "a.py", "content": "x"})
+            # 只读工具正常执行。
+            obs = executor.execute("list_files", {"path": "."})
+            self.assertIsInstance(obs, str)
 
     def test_missing_task_raises_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -173,6 +198,22 @@ class OrchestratorTest(unittest.TestCase):
             return AgentLoop(wparams, llm=worker_llm, tools=executor)
 
         register_worker_tool()  # 与 cli 装配一致：注册委派工具
+        return OrchestratorLoop(inner, worker_factory=worker_factory)
+
+    def _make_orchestrator_readonly(
+        self, tmpdir: str, orchestrator_llm: FakeLLM, worker_llm: FakeLLM
+    ) -> OrchestratorLoop:
+        """与 build_orchestrator_loop 一致的工人装配：只读白名单 executor。"""
+        executor = RecordingExecutor(tmpdir)
+        params = AgentParams(cwd=tmpdir)
+        inner = AgentLoop(params, llm=orchestrator_llm, tools=executor)
+
+        def worker_factory(task, role, worker_turns):
+            wparams = AgentParams(cwd=tmpdir, max_turns=worker_turns or 12)
+            wtools = ToolExecutor(tmpdir, tool_names=sorted(read_only_tool_names()))
+            return AgentLoop(wparams, llm=worker_llm, tools=wtools)
+
+        register_worker_tool()
         return OrchestratorLoop(inner, worker_factory=worker_factory)
 
     def test_delegate_end_to_end(self):
@@ -270,6 +311,45 @@ class OrchestratorTest(unittest.TestCase):
             tool_msg = [m for m in msgs if m.role == "tool"][0]
             self.assertTrue(tool_msg.content.startswith("FAILED:"))
             self.assertIn("worker boom", tool_msg.content)
+
+    def test_worker_write_denied_e2e(self):
+        """工人试图写文件 → 只读白名单拒绝 → 编排者仍正常收口。
+
+        验证写者归一：worker 的写调用被拒绝（可恢复 ValidationError 回灌），
+        文件未被改动，编排者拿到 DONE 结论继续。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "a.py"
+            target.write_text("print(1)", encoding="utf-8")
+            orch_llm = FakeLLM(
+                [
+                    LLMResponse(
+                        text="",
+                        tool_calls=[tc("delegate_agent", {"task": "修改 a.py"}, "call_d")],
+                    ),
+                    "已了解",
+                ]
+            )
+            worker_llm = FakeLLM(
+                [
+                    LLMResponse(
+                        text="",
+                        tool_calls=[
+                            tc("write_file", {"path": "a.py", "content": "print(2)"}, "w1")
+                        ],
+                    ),
+                    "无法修改，提交建议",  # worker 看到拒绝观察后收敛
+                ]
+            )
+            orch = self._make_orchestrator_readonly(tmp, orch_llm, worker_llm)
+            resp = orch.run(AgentRequest(user_input="委派修改"))
+
+            self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
+            msgs = orch_llm.calls[1][0]
+            tool_msg = [m for m in msgs if m.role == "tool"][0]
+            self.assertTrue(tool_msg.content.startswith("DONE:"))
+            # 文件未被改动（写者归一）。
+            self.assertEqual(target.read_text(encoding="utf-8"), "print(1)")
 
 
 class BuildOrchestratorTest(unittest.TestCase):

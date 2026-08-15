@@ -6,7 +6,8 @@
 文本化为观察结果返回。主循环（AgentLoop）对多 agent 完全无感知。
 
 - 工具标 ``risk="read"``（默认免询问）：委派本身不直接修改工作区，
-  工人内部写操作仍受底层 shell 黑名单 / 工具错误体系兜底；
+  工人的写操作已由**只读白名单**（schema + executor 双保险）杜绝——
+  写者归一，写统一由编排者执行；
 - 线程局部 host：编排者 ``run()`` 期间在**当前线程**设置 host，
   结束后清除。工人跑在后台线程，其线程内没有 host —— 因此
   **禁止嵌套委派**（工人调用 delegate_agent 会得到错误观察），
@@ -94,13 +95,32 @@ def register_worker_tool() -> None:
         return result.to_observation()
 
 
-def worker_tools_schema() -> list[dict[str, Any]]:
-    """工人看到的工具 schema：全量工具去掉 ``delegate_agent``。
+def read_only_tool_names() -> set[str]:
+    """从注册表推导只读工具名集合（risk=="read"），显式排除 delegate_agent。
 
-    防止工人嵌套委派（其线程内没有编排者 host，调用会得到错误观察，
-    不如在 schema 层直接不可见，从源头避免模型发起递归委派）。
+    写者归一的安全核心：工人只有只读工具可用。schema（工人看不到写工具）
+    与 executor 白名单（调了也拒绝）共用此集合；未来新增只读工具自动纳入。
     """
-    return [t for t in to_openai_tools() if t.get("function", {}).get("name") != "delegate_agent"]
+    return {
+        name
+        for name, spec in TOOLS.items()
+        if spec.risk == "read" and name != "delegate_agent"
+    }
+
+
+def worker_tools_schema() -> list[dict[str, Any]]:
+    """工人看到的工具 schema：只渲染只读工具（与 executor 白名单一致）。
+
+    写者归一：工人只做只读调研、产出建议（patch 文本），不直接落盘；
+    写操作由编排者统一执行与裁决。schema 层与 executor 层双保险——
+    即使模型幻想调用写工具，也会被白名单拒绝（ValidationError 回灌）。
+    """
+    allowed = read_only_tool_names()
+    return [
+        t
+        for t in to_openai_tools()
+        if t.get("function", {}).get("name") in allowed
+    ]
 
 
 def unregister_worker_tool() -> None:

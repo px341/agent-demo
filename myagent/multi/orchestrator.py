@@ -13,11 +13,14 @@
 - 工人的 ReAct 轨迹只在本地累积，不进入编排者的消息历史——
   编排者只见一条 ``delegate_agent`` 工具消息及其文本观察；
 - 工人不带 memory / composer / approval（后台线程不能弹交互审批），
-  写操作仍受底层 shell 黑名单与工具错误体系兜底。
+  且只有**只读工具**（executor 白名单 + schema 双保险）——
+  **写者归一**：写操作统一由编排者执行，多个工人的写意图以 patch
+  文本回传，由编排者裁决落盘，从源头杜绝并发写同一文件的冲突。
 
 委派并发：工人经 ``ThreadPoolExecutor`` 限流运行，同一批内多次
-``delegate_agent`` 按模型下发顺序**顺序执行**（工人共享工作区，
-并发写同一文件可能竞态，顺序是安全默认；池为异常隔离与后续并行铺路）。
+``delegate_agent`` 按模型下发顺序**顺序执行**（池为异常隔离与后续
+并行铺路；并行是安全的——工人只读、无共享可变状态，池线程数上限
+只约束同时存活的工人数）。
 """
 from __future__ import annotations
 
@@ -33,10 +36,16 @@ from ..contracts import (
     AgentResponse,
     LLMClient,
     StopReason,
-    ToolExecutor,
 )
+from ..tools import ToolExecutor as RealToolExecutor
 from .context import render_worker_prompt
-from .worker_tool import _clear_host, _set_host, register_worker_tool, worker_tools_schema
+from .worker_tool import (
+    _clear_host,
+    _set_host,
+    read_only_tool_names,
+    register_worker_tool,
+    worker_tools_schema,
+)
 
 #: 工人推理轮数默认上限。
 WORKER_MAX_TURNS = 12
@@ -209,7 +218,9 @@ def build_orchestrator_loop(
     - 工人 loop：独立 AgentParams（同 cwd、同 token 预算、轮数上限可调），
       环境模板从主 ``prompt_dir`` 解析，system prompt 由
       ``render_worker_prompt`` 按角色渲染覆盖；
-    - 工人共享同一个 ToolExecutor（同一工作目录上下文）。
+    - 工人用**独立的只读 ToolExecutor**（``tool_names=read_only_tool_names()``）：
+      写者归一——工人只能读，不能直接落盘；建议改动以 patch 文本产出，
+      由编排者统一应用裁决。schema 与 executor 双保险，杜绝并发写冲突。
     """
     inner = AgentLoop(
         agent_params,
@@ -230,11 +241,17 @@ def build_orchestrator_loop(
             max_output_tokens=agent_params.max_output_tokens,
             tool_timeout=agent_params.tool_timeout,
         )
+        # 独立只读执行器：不与编排者共享 tools 实例，白名单强制只读。
+        worker_tools = RealToolExecutor(
+            agent_params.cwd,
+            timeout=agent_params.tool_timeout,
+            tool_names=sorted(read_only_tool_names()),
+        )
         loop = AgentLoop(
             params,
             llm=llm,
-            tools=tools,
-            # 工人不可见 delegate_agent：worker_tools_schema 已过滤。
+            tools=worker_tools,
+            # 工人 schema 只渲染只读工具（与 executor 白名单一致）。
             tools_schema=worker_tools_schema,
         )
         loop.system_prompt = render_worker_prompt(prompt_dir, task, role=role)
