@@ -49,7 +49,7 @@ REPL 内建命令：`/exit`、`/quit`。
 | `agent_loop.py` | ReAct 主循环；轨迹记录；`step_to_messages` 消息重建；注入记忆段 |
 | `actions.py` | 模型输出解析为 `ToolCall` / `FinalAnswer` / `Retry` |
 | `tools/` | 工具注册表与执行器（`read_file` / `list_files` 等 10 个，装饰器注册扩展） |
-| `memory/` | 记忆系统：会话 jsonl 存档、脱敏、水位线摘要、跨会话注入（`MemoryManager`） |
+| `memory/` | 记忆系统：会话 jsonl 存档、脱敏、水位线摘要、关键词索引按相关性检索注入（`MemoryManager`） |
 | `context/` | 上下文压缩：三部分预算管理（system+memory / 本轮 session / 用户输入） |
 | `multi/` | 多 agent：编排者-工人模式（`OrchestratorLoop` / `delegate_agent` 工具 / 工人提示词渲染） |
 | `prompts/` | 系统提示词（工具 / 环境 / 摘要提取 / 摘要聚合 / 工人 worker.md / 角色 worker_<role>.md） |
@@ -78,7 +78,7 @@ REPL 内建命令：`/exit`、`/quit`。
 ## 现状与待办
 
 - 工具（10 个：文件/目录读写改删）已接入 CLI，read 免询问、write/delete 走审批闸门；
-- 记忆系统已接入：启动时自动汇总历史会话（`sweep()`，mtime 水位线幂等 + 失败重试），REPL 每轮存档会话原文（脱敏），退出标记会话；`memories/summary.md` 作为「跨会话记忆」注入 system prompt（默认 4000 字符截断）。`--no_memory` 可禁用；
+- 记忆系统已接入：启动时自动汇总历史会话（`sweep()`，mtime 水位线幂等 + 失败重试），REPL 每轮存档会话原文（脱敏），退出标记会话。单会话摘要带 `keywords` 关键词索引（旧摘要词法兜底补索引，零额外 LLM 成本）；注入时按当前请求相关性检索（`context_block(query)`，纯词法匹配），命中则优先注入相关会话摘要、全局 `summary.md` 兜底，无命中回落全量聚合（默认 4000 字符预算）。`--no_memory` 可禁用；
 - 上下文压缩已接入：默认启用，按预算压缩输入（tool 单条裁剪 + 总量丢弃 + 非 tool 丢弃）；`--no_compose` 可禁用。`max_input_tokens` 由此生效；
 - REPL 历史有上限（默认 300 条消息），超出后配对安全裁剪，保证不产生孤儿消息。
 

@@ -96,6 +96,18 @@ def summary_payload_path(tmp: Path, session_id: str) -> Path:
     return tmp / "memories" / f"{session_id}.summary.md"
 
 
+def write_summary(tmp: Path, session_id: str, payload: dict) -> Path:
+    """直接写一个单会话摘要文件（与 Summarizer 产物的 markdown 同构）。"""
+    path = summary_payload_path(tmp, session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps(payload, ensure_ascii=False, indent=2)
+    path.write_text(
+        f"# 会话摘要 {session_id}\n\n```json\n{body}\n```\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 class ArchiveTest(unittest.TestCase):
     """jsonl 往返 / 脱敏 / files_changed 机械提取。"""
 
@@ -540,7 +552,7 @@ class AggregateTest(unittest.TestCase):
 
 
 class ContextBlockTest(unittest.TestCase):
-    """注入文本：截断、空内容返回空串。"""
+    """注入文本：截断、空内容返回空串、按相关性检索注入。"""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -571,6 +583,86 @@ class ContextBlockTest(unittest.TestCase):
         (self.tmp / "memories").mkdir(parents=True, exist_ok=True)
         (self.tmp / "memories" / "summary.md").write_text("   \n\n  ", encoding="utf-8")
         self.assertEqual(make_manager(self.tmp).context_block(), "")
+
+    def test_context_block_query_empty_falls_back_to_global(self):
+        """query 为空/None 维持现状：注入全局 summary.md，不检索。"""
+        mgr = make_manager(self.tmp, max_context_chars=1000)
+        write_summary(self.tmp, "session_a", {
+            "rollout_summary": "A 主题的内容", "raw_memory": "m",
+            "keywords": ["memory"],
+        })
+        (self.tmp / "memories" / "summary.md").write_text(
+            "# 跨会话记忆\n\n全局聚合", encoding="utf-8"
+        )
+        self.assertIn("全局聚合", mgr.context_block(query=None))
+        self.assertIn("全局聚合", mgr.context_block(query="   "))
+        # 全量注入不包含检索标题。
+        self.assertNotIn("相关会话记忆", mgr.context_block(query=None))
+
+    def test_context_block_query_hit_injects_relevant_first(self):
+        """query 命中相关摘要：相关摘要置顶，全局 summary.md 兜底。"""
+        mgr = make_manager(self.tmp, max_context_chars=1000)
+        write_summary(self.tmp, "session_mem", {
+            "rollout_summary": "实现了记忆检索", "raw_memory": "memory 细节",
+            "keywords": ["memory", "检索"],
+        })
+        write_summary(self.tmp, "session_git", {
+            "rollout_summary": "git 冲突处理", "raw_memory": "patch 经验",
+            "keywords": ["git"],
+        })
+        (self.tmp / "memories" / "summary.md").write_text(
+            "# 跨会话记忆\n\n全局聚合", encoding="utf-8"
+        )
+        block = mgr.context_block(query="记忆检索怎么实现的")
+        self.assertIn("## 相关会话记忆（命中 1 条）", block)
+        self.assertIn("实现了记忆检索", block)
+        self.assertNotIn("git 冲突处理", block)
+        self.assertIn("全局聚合", block)  # 兜底仍在
+
+    def test_context_block_query_no_hit_falls_back_to_global(self):
+        """query 无命中：不注入空检索段，回落全局 summary.md。"""
+        mgr = make_manager(self.tmp, max_context_chars=1000)
+        write_summary(self.tmp, "session_a", {
+            "rollout_summary": "A 主题的内容", "raw_memory": "m",
+            "keywords": ["memory"],
+        })
+        (self.tmp / "memories" / "summary.md").write_text(
+            "# 跨会话记忆\n\n全局聚合", encoding="utf-8"
+        )
+        block = mgr.context_block(query="完全没有关系的查询词")
+        self.assertNotIn("相关会话记忆", block)
+        self.assertIn("全局聚合", block)
+
+    def test_context_block_query_without_summary_files_empty(self):
+        """只有 query、没有任何摘要文件 → 空串（主循环不注入空段）。"""
+        mgr = make_manager(self.tmp)
+        self.assertEqual(mgr.context_block(query="anything"), "")
+
+    def test_context_block_legacy_summary_retrievable(self):
+        """旧摘要（无 keywords）词法兜底后可被 query 命中注入。"""
+        mgr = make_manager(self.tmp, max_context_chars=1000)
+        write_summary(self.tmp, "session_old", {
+            "rollout_summary": "改动了 agent_loop.py 注入记忆段",
+            "raw_memory": "用 context_block 组装",
+            "files_changed": ["agent_loop.py"],
+        })  # 无 keywords → 旧契约，词法兜底
+        (self.tmp / "memories" / "summary.md").write_text(
+            "# 跨会话记忆\n\n全局聚合", encoding="utf-8"
+        )
+        block = mgr.context_block(query="agent_loop.py 怎么改的")
+        self.assertIn("相关会话记忆", block)
+        self.assertIn("改动了 agent_loop.py", block)
+
+    def test_context_block_query_relevant_keeps_within_budget(self):
+        """检索注入同样受 max_chars 预算约束：截断后总长有限。"""
+        mgr = make_manager(self.tmp, max_context_chars=30)
+        write_summary(self.tmp, "session_a", {
+            "rollout_summary": "A" * 200, "raw_memory": "m",
+            "keywords": ["memory"],
+        })
+        block = mgr.context_block(query="memory 相关内容")
+        self.assertIn("已截断", block)
+        self.assertLess(len(block), 200)
 
 
 class AgentLoopMemoryTest(unittest.TestCase):
@@ -624,6 +716,34 @@ class AgentLoopMemoryTest(unittest.TestCase):
         system = llm.calls[0][0].content
         self.assertNotIn("跨会话记忆", system)
         self.assertIn("工作环境与角色", system)
+
+    def test_memory_block_injected_for_each_request(self):
+        # 每轮 run 都以当前请求为 query 重新构建记忆段。
+        memory = FakeMemory()
+        llm = FakeLLM(["ok", "ok"])
+        loop = self._loop_with_memory(llm, memory)
+        loop.run(AgentRequest(user_input="第一问"))
+        loop.run(AgentRequest(user_input="第二问"))
+        self.assertEqual(memory.queries, ["第一问", "第二问"])
+
+    def test_relevant_memory_block_injected_on_query_hit(self):
+        # 端到端：query 命中相关摘要时，记忆段包含相关会话内容。
+        (self.tmp / "memories").mkdir(parents=True, exist_ok=True)
+        write_summary(self.tmp, "session_mem", {
+            "rollout_summary": "实现了记忆检索注入",
+            "raw_memory": "context_block 按 query 检索",
+            "keywords": ["memory", "检索"],
+        })
+        (self.tmp / "memories" / "summary.md").write_text(
+            "# 跨会话记忆\n\n全局聚合", encoding="utf-8"
+        )
+        mgr = make_manager(self.tmp)
+        llm = FakeLLM(["ok"])
+        loop = self._loop_with_memory(llm, mgr)
+        loop.run(AgentRequest(user_input="记忆检索是怎么实现的"))
+        system = llm.calls[0][0].content
+        self.assertIn("相关会话记忆", system)
+        self.assertIn("实现了记忆检索注入", system)
 
 
 class SweepWithoutLLMTest(unittest.TestCase):
@@ -719,6 +839,145 @@ class SummarizerDirectTest(unittest.TestCase):
         self.assertIsNone(_parse_json_object("完全没有对象"))
         self.assertIsNone(_parse_json_object("{broken"))
         self.assertIsNone(_parse_json_object(""))
+
+    def test_build_keywords_lexical_fallback(self):
+        from myagent.memory.summarizer import build_keywords
+
+        text = (
+            "本次改动了 summarizer.py 和 index.py，"
+            "用 write_file 处理了 build_keywords 提取"
+        )
+        kws = build_keywords(text)
+        self.assertIn("summarizer.py", kws)
+        self.assertIn("index.py", kws)
+        self.assertIn("write_file", kws)
+        self.assertIn("build_keywords", kws)
+        # 去重保序。
+        self.assertEqual(kws, list(dict.fromkeys(kws)))
+
+    def test_build_keywords_filters_stopwords_and_limits(self):
+        from myagent.memory.summarizer import build_keywords
+
+        kws = build_keywords(
+            "the and for with 输出 结果 "
+            + " ".join(f"token_{i}" for i in range(50))
+        )
+        self.assertNotIn("the", kws)
+        self.assertNotIn("输出", kws)
+        self.assertEqual(len(kws), 20)  # 默认上限（50 个唯一 token 只留 20）
+
+    def test_parse_summary_markdown_legacy_without_keywords(self):
+        from myagent.memory.summarizer import parse_summary_markdown
+
+        text = (
+            "# 会话摘要 session_x\n\n```json\n"
+            '{"rollout_summary": "改了 a.py", "raw_memory": "m",'
+            ' "files_changed": ["a.py"]}\n'
+            "```\n"
+        )
+        payload = parse_summary_markdown(text)
+        # 旧契约无 keywords → 词法兜底补索引（a.py 从正文提取）。
+        self.assertIn("a.py", payload["keywords"])
+        self.assertEqual(payload["files_changed"], ["a.py"])
+
+    def test_parse_summary_markdown_bad_input_empty(self):
+        from myagent.memory.summarizer import parse_summary_markdown
+
+        self.assertEqual(parse_summary_markdown("完全不是摘要"), {})
+
+
+class MemoryIndexTest(unittest.TestCase):
+    """关键词检索索引：tokenize / index_summaries / rank 打分排序。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        (self.tmp / "memories").mkdir(parents=True, exist_ok=True)
+
+    def test_tokenize_covers_paths_tools_stopwords_hanzi(self):
+        from myagent.memory.index import tokenize
+
+        tokens = tokenize("帮我改 agent_loop.py，用 write_file 处理 memory")
+        self.assertIn("agent_loop.py", tokens)   # 文件路径
+        self.assertIn("write_file", tokens)      # 工具名
+        self.assertIn("memory", tokens)          # 英文名词（非停用词）
+        self.assertIn("帮我", tokens)            # 中文 bigram
+        self.assertNotIn("with", tokens)         # 英文停用词过滤
+
+    def test_index_summaries_scans_sorts_and_skips_bad(self):
+        from myagent.memory.index import index_summaries
+
+        write_summary(self.tmp, "session_b", {
+            "rollout_summary": "B 做的事", "raw_memory": "m",
+            "files_changed": ["b.py"], "keywords": ["git"],
+        })
+        write_summary(self.tmp, "session_a", {
+            "rollout_summary": "A 做的事", "raw_memory": "m",
+            "files_changed": [], "keywords": ["memory"],
+        })
+        # 解析失败的文件跳过。
+        (self.tmp / "memories" / "session_bad.summary.md").write_text(
+            "完全不是摘要", encoding="utf-8"
+        )
+        entries = index_summaries(self.tmp / "memories")
+        self.assertEqual(
+            [e["session_id"] for e in entries], ["session_a", "session_b"]
+        )
+        self.assertIn("A 做的事", entries[0]["text"])
+        self.assertIn("改动文件：b.py", entries[1]["text"])
+
+    def test_rank_exact_match_orders_first(self):
+        from myagent.memory.index import rank
+
+        entries = [
+            {"session_id": "s_git", "keywords": ["git", "patch"], "text": "B"},
+            {"session_id": "s_mem", "keywords": ["memory", "index.py"], "text": "A"},
+        ]
+        hits = rank("memory 相关实现", entries)
+        self.assertEqual([h["session_id"] for h in hits], ["s_mem"])
+        self.assertGreater(hits[0]["score"], 0)
+
+    def test_rank_chinese_bigram_substring(self):
+        from myagent.memory.index import rank
+
+        entries = [
+            {"session_id": "s1", "keywords": ["上下文压缩"], "text": "A"},
+            {"session_id": "s2", "keywords": ["git_apply_patch"], "text": "B"},
+        ]
+        hits = rank("上下文压缩怎么做的", entries)
+        self.assertEqual([h["session_id"] for h in hits], ["s1"])
+
+    def test_rank_no_match_returns_empty(self):
+        from myagent.memory.index import rank
+
+        entries = [
+            {"session_id": "s1", "keywords": ["memory"], "text": "A"},
+        ]
+        self.assertEqual(rank("完全不相关的查询词 xyz", entries), [])
+
+    def test_rank_empty_query_returns_empty(self):
+        from myagent.memory.index import rank
+
+        entries = [
+            {"session_id": "s1", "keywords": ["memory"], "text": "A"},
+        ]
+        self.assertEqual(rank("", entries), [])
+
+    def test_legacy_summary_without_keywords_retrievable(self):
+        """旧摘要（无 keywords）词法兜底后仍可被相关性检索命中。"""
+        from myagent.memory.index import index_summaries, rank
+
+        write_summary(self.tmp, "session_old", {
+            "rollout_summary": "改动了 summarizer.py 和 index.py",
+            "raw_memory": "用 build_keywords 做词法提取",
+            "files_changed": ["summarizer.py"],
+        })  # 无 keywords 字段 → 旧契约
+        entries = index_summaries(self.tmp / "memories")
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0]["keywords"])  # 词法兜底补上了索引
+        hits = rank("summarizer.py 有什么改动", entries)
+        self.assertEqual([h["session_id"] for h in hits], ["session_old"])
 
 
 class CliMemoryTest(unittest.TestCase):
@@ -827,8 +1086,10 @@ class FakeMemory:
         self.session_id = "session_test"
         self.appended = []
         self.closed = False
+        self.queries = []
 
-    def context_block(self, max_chars=None):
+    def context_block(self, query=None, max_chars=None):
+        self.queries.append(query)
         return ""
 
     def append_message(self, message):

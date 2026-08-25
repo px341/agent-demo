@@ -13,7 +13,8 @@
 - ``composer``：ContextComposer（可选，None 表示不压缩上下文）。
 
 工具执行、记忆、上下文压缩的具体实现各自接入，主循环只感知注入接口：
-memory 的聚合摘要经 ``context_block()`` 前置进 system prompt。
+memory 的聚合摘要经 ``context_block(query=...)`` 前置进 system prompt，
+query 为当前请求文本（记忆实现按相关性检索注入相关会话摘要）。
 """
 from __future__ import annotations
 
@@ -138,15 +139,16 @@ class AgentLoop:
         #: 多 agent 场景按角色裁剪（如工人不暴露 delegate_agent）时覆盖。
         self._tools_schema = tools_schema or to_openai_tools
 
-    def _build_context_prompt(self) -> str:
+    def _build_context_prompt(self, user_input: str) -> str:
         """拼接本次请求的系统提示：跨会话记忆 + 动态环境 prompt + 静态工具 prompt。
 
         每次 run 重新生成，保证 workspace tree 反映最新工作区状态。
-        记忆段仅在注入 MemoryStore 且聚合摘要非空时前置。
+        记忆段仅在注入 MemoryStore 且聚合摘要非空时前置；传入当前请求
+        作为 query，由记忆实现按相关性检索注入相关会话摘要。
         """
         memory_block = ""
         if self.memory is not None:
-            memory_block = self.memory.context_block()
+            memory_block = self.memory.context_block(query=user_input)
 
         environment = build_environment_prompt(
             self.agent_params.prompt_dir,
@@ -192,7 +194,7 @@ class AgentLoop:
         # 本次请求的消息上下文：系统提示（环境 + 工具） + 会话历史 + 当前请求。
         # 不修改调用方传入的历史；注入 composer 时由它按预算压缩三部分，
         # 未注入则原样拼接。
-        system = self._build_context_prompt()
+        system = self._build_context_prompt(request.user_input)
         if self.composer is not None:
             messages = self.composer.compose(
                 system, list(request.messages or []), request.user_input

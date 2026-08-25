@@ -86,8 +86,15 @@ class MemoryStore(Protocol):
     #: 会话上下文唯一标识（JSONL 存档 / 状态文件名）。
     session_id: str
 
-    def context_block(self, max_chars: int | None = None) -> str:
-        """返回注入 system prompt 的跨会话记忆文本；无记忆或空内容时返回 ""。"""
+    def context_block(
+        self, query: str | None = None, max_chars: int | None = None
+    ) -> str:
+        """返回注入 system prompt 的跨会话记忆文本；无记忆或空内容时返回 ""。
+
+        - ``query``：当前请求文本。非空时实现应按相关性检索单会话摘要
+          优先注入（无命中时回落全局聚合），None 则维持现状（全量 summary.md）；
+        - ``max_chars``：注入预算上限；None 时由实现用默认值。
+        """
 
     def append_message(self, message: Message) -> None:
         """把一条会话消息（脱敏后）追加写入本次会话 JSONL 存档。"""

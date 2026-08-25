@@ -12,7 +12,10 @@
 - 可重试：LLM 失败记 ``status=failed, retry+1``，下次启动重试，超过
   ``max_retry``（默认 3 次）放弃并标记 ``failed_done``；
 - 聚合：本次扫描有单会话摘要内容变化（sha256 比对 manifest）才全量重写
-  ``summary.md``，无变化零调用；聚合失败记 ``aggregate_error`` 下次重试。
+  ``summary.md``，无变化零调用；聚合失败记 ``aggregate_error`` 下次重试；
+- 注入：:meth:`context_block` 带 ``query``（当前请求）时按关键词相关性
+  检索单会话摘要（``index.rank``，纯词法零 LLM 成本），命中则优先注入
+  top-K 相关摘要、剩余预算给全局 ``summary.md`` 兜底；无命中回落全局。
 
 ``MemoryManager`` 可无 LLM 构造（``llm=None``），此时仅作为存档器：
 ``append_message`` / ``close_session`` 正常，``sweep`` 无副作用。
@@ -29,6 +32,7 @@ from typing import Any
 from ..agent_config import Message
 from ..contracts import LLMClient
 from .archive import append_archive, archive_path, read_archive
+from .index import index_summaries, rank
 from .summarizer import SummarizeError, Summarizer
 
 #: 状态值。
@@ -46,6 +50,9 @@ DEFAULT_MAX_RETRY = 3
 
 #: 注入 system prompt 的跨会话记忆截断字符数。
 DEFAULT_MAX_CONTEXT_CHARS = 4000
+
+#: 相关检索注入时优先注入的单会话摘要条数。
+DEFAULT_TOP_K = 2
 
 #: 聚合 manifest 文件名。
 AGGREGATE_MANIFEST = "aggregate.json"
@@ -111,12 +118,24 @@ class MemoryManager:
 
     # ---- 注入（主循环读取） ----
 
-    def context_block(self, max_chars: int | None = None) -> str:
-        """读取跨会话聚合摘要 summary.md，截断后包成 markdown 段返回。
+    def context_block(
+        self, query: str | None = None, max_chars: int | None = None
+    ) -> str:
+        """返回注入 system prompt 的跨会话记忆文本；无记忆或空内容时返回 ""。
 
-        无摘要文件或内容为空时返回 ""（主循环不注入空段）。
+        - ``query`` 非空 → 按关键词相关性检索单会话摘要，命中则优先注入
+          top-K 相关摘要，剩余预算再给全局 summary.md 兜底；无命中回落全局；
+        - ``query`` 为空/None → 维持现状：全量 summary.md 截断注入。
         """
         limit = max_chars or self.max_context_chars
+        if query and query.strip():
+            block = self._relevant_block(query.strip(), limit)
+            if block:
+                return block
+        return self._global_block(limit)
+
+    def _global_block(self, limit: int) -> str:
+        """全量聚合摘要 summary.md，截断后包成 markdown 段返回。"""
         summary_file = self.memory_dir / "summary.md"
         try:
             content = summary_file.read_text(encoding="utf-8").strip()
@@ -127,6 +146,37 @@ class MemoryManager:
         if len(content) > limit:
             content = content[:limit] + "\n…（已截断）"
         return f"## 跨会话记忆\n\n{content}"
+
+    def _relevant_block(self, query: str, limit: int) -> str:
+        """按相关性检索单会话摘要：相关摘要（top-K）+ 全局 summary.md 兜底。
+
+        无摘要文件或全部无命中时返回 ""（调用方回落 :meth:`_global_block`）。
+        """
+        hits = rank(query, index_summaries(self.memory_dir))
+        if not hits:
+            return ""
+        top = hits[:DEFAULT_TOP_K]
+        parts = [f"## 相关会话记忆（命中 {len(top)} 条）"]
+        budget = limit
+        for item in top:
+            text = item["text"]
+            if budget <= 0:
+                break
+            if len(text) > budget:
+                text = text[:budget] + "\n…（已截断）"
+            parts.append(text)
+            budget -= len(text)
+        # 剩余预算给全局聚合摘要兜底，保证整体概览仍在。
+        summary_file = self.memory_dir / "summary.md"
+        try:
+            content = summary_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            content = ""
+        if content and budget > 0:
+            if len(content) > budget:
+                content = content[:budget] + "\n…（已截断）"
+            parts.append(f"## 跨会话记忆（全局兜底）\n\n{content}")
+        return "\n\n".join(parts)
 
     # ---- 汇总（下次启动，由调用方触发） ----
 

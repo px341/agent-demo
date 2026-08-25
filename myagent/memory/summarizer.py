@@ -24,6 +24,92 @@ DEFAULT_MAX_TRANSCRIPT_CHARS = 30000
 #: 无法解析时降级保存的原始输出截断长度。
 FALLBACK_RAW_LIMIT = 2000
 
+#: 词法兜底关键词提取的通用停用词（英文 token 与高频中文虚词）。
+_STOPWORDS = {
+    "the", "and", "for", "with", "this", "that", "from", "into", "what",
+    "was", "were", "have", "has", "had", "not", "but", "are", "its",
+    "will", "been", "they", "them", "then", "than", "just", "also",
+    "when", "where", "which", "while", "because", "about", "after",
+    "before", "more", "most", "some", "such", "only", "over", "under",
+    "would", "could", "should", "does", "done", "did", "doing", "ok",
+    "can", "may", "get", "got", "let", "use", "used", "via",
+    "可以", "进行", "完成", "使用", "需要", "一个", "一次", "相关",
+    "输出", "结果", "内容", "文件", "工作", "代码", "修改", "实现",
+    "没有", "已经", "然后", "通过", "对于", "我们", "自己", "当前",
+    # 摘要 JSON 契约的字段名/结构词（词法兜底时不应成为关键词）。
+    "rollout_summary", "raw_memory", "files_changed", "keywords",
+    "json", "session", "summary", "会话摘要", "改动文件",
+}
+
+#: 已知工具名（词法关键词提取时优先收录；与 tools/ 注册表保持一致）。
+TOOL_NAMES = {
+    "read_file", "create_file", "write_file", "edit_file", "delete_file",
+    "list_files", "create_dir", "write_dir", "rename_dir", "delete_dir",
+    "run_shell", "git_status", "git_diff", "git_apply_patch",
+    "delegate_agent",
+}
+
+#: 文件路径/文件名模式（词法关键词提取）。
+_FILE_RE = re.compile(
+    r"[\w./-]+\.(?:py|md|json|jsonl|toml|txt|sh|js|ts|go|rs|java|c|cpp|"
+    r"h|yml|yaml|ini|cfg|log|html|css|env|lock)\b",
+    re.IGNORECASE,
+)
+
+#: 英文 token 模式（词法关键词提取）。
+_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
+
+
+def _normalize_keywords(value: Any) -> list[str]:
+    """规范化模型输出的 keywords：只保留非空字符串，去重保序。"""
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        item = item.strip()
+        key = item.lower()
+        if item and key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def build_keywords(text: str, limit: int = 20) -> list[str]:
+    """词法兜底关键词：从文本机械提取文件路径/文件名、工具名、英文 token。
+
+    用于旧摘要（LLM 未产出 keywords 字段）在读取/检索时补索引，
+    零 LLM 成本。去重保序，最多返回 ``limit`` 个。
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(token: str) -> None:
+        key = token.lower()
+        if key not in seen:
+            seen.add(key)
+            found.append(token)
+
+    for match in _FILE_RE.finditer(text):
+        add(match.group(0))
+        if len(found) >= limit:
+            return found
+    for name in TOOL_NAMES:
+        if re.search(rf"\b{re.escape(name)}\b", text):
+            add(name)
+            if len(found) >= limit:
+                return found
+    for match in _TOKEN_RE.finditer(text):
+        token = match.group(0)
+        if token.lower() in _STOPWORDS:
+            continue
+        add(token)
+        if len(found) >= limit:
+            break
+    return found
+
 
 class SummarizeError(Exception):
     """LLM 调用失败（网络/API 异常）等可重试错误。"""
@@ -117,6 +203,25 @@ def _render_summary_markdown(session_id: str, payload: dict[str, Any]) -> str:
     )
 
 
+def parse_summary_markdown(text: str) -> dict[str, Any]:
+    """把 :func:`_render_summary_markdown` 产物解析回 payload dict。
+
+    兼容旧契约（LLM 未产出 keywords 的摘要文件）：
+    ``keywords`` 缺失或为空时用 :func:`build_keywords` 词法兜底补索引，
+    零 LLM 成本。解析失败返回 {}。
+    """
+    payload = _parse_json_object(text)
+    if payload is None:
+        return {}
+    payload.setdefault("files_changed", [])
+    payload.setdefault("raw_memory", "")
+    keywords = _normalize_keywords(payload.get("keywords"))
+    if not keywords:
+        keywords = build_keywords(text)
+    payload["keywords"] = keywords
+    return payload
+
+
 class Summarizer:
     """用注入的 LLMClient 生成单会话摘要与跨会话聚合摘要。"""
 
@@ -169,12 +274,14 @@ class Summarizer:
                 "rollout_summary": raw,
                 "files_changed": files_changed,
                 "raw_memory": "",
+                "keywords": [],
             }
         else:
             payload = {
                 "rollout_summary": str(payload.get("rollout_summary", "")).strip(),
                 "files_changed": files_changed,
                 "raw_memory": str(payload.get("raw_memory", "")).strip(),
+                "keywords": _normalize_keywords(payload.get("keywords")),
             }
         return _render_summary_markdown(session_id, payload)
 
