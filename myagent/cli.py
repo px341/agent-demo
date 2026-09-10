@@ -103,7 +103,11 @@ def main() -> int:
             composer=composer,
         )
 
-    return _repl(loop, memory)
+    try:
+        return _repl(loop, memory)
+    finally:
+        if args.multi_agent:
+            loop.close()
 
 
 def _sweep_memory(memory: MemoryManager) -> None:

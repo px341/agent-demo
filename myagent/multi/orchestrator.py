@@ -2,7 +2,7 @@
 
 设计要点：编排者就是一个普通 ``AgentLoop``，通过注入的
 ``delegate_agent`` 工具获得委派能力；工人是后台线程里临时创建的
-另一个 ``AgentLoop``（共享同一 LLM client 与工作目录/工具执行器），
+另一个 ``AgentLoop``（共享同一 LLM client 与工作目录，独立只读执行器），
 跑完一次子任务的完整 ReAct 后，把 ``AgentResponse`` 文本化为观察结果
 返回给编排者继续推理。
 
@@ -17,14 +17,14 @@
   **写者归一**：写操作统一由编排者执行，多个工人的写意图以 patch
   文本回传，由编排者裁决落盘，从源头杜绝并发写同一文件的冲突。
 
-委派并发：工人经 ``ThreadPoolExecutor`` 限流运行，同一批内多次
-``delegate_agent`` 按模型下发顺序**顺序执行**（池为异常隔离与后续
-并行铺路；并行是安全的——工人只读、无共享可变状态，池线程数上限
-只约束同时存活的工人数）。
+委派并发：同一批连续的 ``delegate_agent`` 限流并行运行，结果按调用
+顺序回灌。其他工具是串行屏障：必须等待前面的工人全部结束后执行，
+完成后才启动后续委派。所有写入统一由编排者串行执行。
 """
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import Context
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +36,7 @@ from ..contracts import (
     AgentResponse,
     LLMClient,
     StopReason,
+    ToolExecutor,
 )
 from ..tools import ToolExecutor as RealToolExecutor
 from .context import render_worker_prompt
@@ -155,6 +156,8 @@ class OrchestratorLoop:
         max_workers: int = 4,
     ):
         self.inner = inner_loop
+        self.inner.parallel_tool_names = frozenset({"delegate_agent"})
+        self.inner.max_parallel_tools = max(1, max_workers)
         self._worker_factory = worker_factory
         #: 工人执行池：限流并发 + 异常隔离（future.result 捕获线程内异常）。
         self._pool = ThreadPoolExecutor(
@@ -162,12 +165,16 @@ class OrchestratorLoop:
         )
 
     def run(self, request: AgentRequest) -> AgentResponse:
-        """代理到内层主循环；运行期间把自身挂到线程局部供 delegate_agent 取用。"""
-        _set_host(self)
+        """运行期间设置委派上下文，结束或异常时恢复。"""
+        token = _set_host(self)
         try:
             return self.inner.run(request)
         finally:
-            _clear_host()
+            _clear_host(token)
+
+    def close(self) -> None:
+        """等待在途工人结束并释放线程池；CLI 退出时调用。"""
+        self._pool.shutdown(wait=True)
 
     def delegate_worker(
         self,
@@ -180,8 +187,11 @@ class OrchestratorLoop:
         任何线程内异常都会转换为 ``WorkerResult(stop=ERROR)``，
         保证委派失败只表现为 FAILED 观察，不打断编排者。
         """
-        future = self._pool.submit(self._run_worker, task, role, worker_turns)
         try:
+            # 明确隔离工人上下文，防止嵌套委派，包括支持线程上下文继承的运行时。
+            future = self._pool.submit(
+                Context().run, self._run_worker, task, role, worker_turns
+            )
             return future.result()
         except Exception as exc:
             return WorkerResult(

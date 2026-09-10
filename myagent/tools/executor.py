@@ -11,6 +11,7 @@ errors.py），由主循环按 recoverable 决定「回灌继续」还是「终�
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from contextvars import copy_context
 from pathlib import Path
 from typing import Any
 
@@ -66,9 +67,13 @@ class ToolExecutor:
             raise ExecutionError(f"工具 {name} 执行失败：{exc}") from exc
 
     def _run_with_timeout(self, func, kwargs: dict) -> str:
-        """在线程池中执行并限制耗时；超时抛 ToolTimeoutError。"""
+        """超时记为 ToolTimeoutError，但退出前仍等待线程结束。
+
+        Python 线程不能强制取消；保留 shutdown(wait=True)，避免超时后
+        在途工具或工人与下一轮写入重叠。需要硬超时的工具应在内部终止子进程。
+        """
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(func, kwargs, self.cwd)
+            future = pool.submit(copy_context().run, func, kwargs, self.cwd)
             try:
                 return str(future.result(timeout=self.timeout))
             except FutureTimeout:

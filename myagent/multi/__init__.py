@@ -2,7 +2,7 @@
 
 - orchestrator.py ：OrchestratorLoop（包装 AgentLoop + 委派能力）与
   build_orchestrator_loop 装配工厂；
-- worker_tool.py   ：``delegate_agent`` 工具注册（线程局部 host）；
+- worker_tool.py   ：``delegate_agent`` 工具注册（显式传播的调用上下文 host）；
 - context.py       ：工人角色提示词渲染（worker_<role>.md / worker.md）。
 
 用法（cli --multi_agent）：:
@@ -11,7 +11,10 @@
         agent_params=params, llm=client, tools=tools,
         worker_prompt_dir=...,
     )
-    response = loop.run(AgentRequest(user_input=...))
+    try:
+        response = loop.run(AgentRequest(user_input=...))
+    finally:
+        loop.close()
 """
 from __future__ import annotations
 

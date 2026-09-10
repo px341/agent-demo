@@ -1,44 +1,41 @@
 """``delegate_agent`` 工具：把子任务委派给工人 agent。
 
 多 agent 的核心接入点：编排者（orchestrator）只是一个普通 AgentLoop，
-通过本工具获得委派能力——工具执行时从**线程局部**取当前编排者 host，
+通过本工具获得委派能力——工具执行时从调用上下文取当前编排者 host，
 调用其 ``delegate_worker(task, role, worker_turns)``，把工人结果
 文本化为观察结果返回。主循环（AgentLoop）对多 agent 完全无感知。
 
 - 工具标 ``risk="read"``（默认免询问）：委派本身不直接修改工作区，
   工人的写操作已由**只读白名单**（schema + executor 双保险）杜绝——
   写者归一，写统一由编排者执行；
-- 线程局部 host：编排者 ``run()`` 期间在**当前线程**设置 host，
-  结束后清除。工人跑在后台线程，其线程内没有 host —— 因此
+- ContextVar host：工具调度和超时线程显式复制调用上下文，
+  工人执行线程使用空上下文，不继承 host —— 因此
   **禁止嵌套委派**（工人调用 delegate_agent 会得到错误观察），
   防止委派失控递归。
 """
 from __future__ import annotations
 
-import threading
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any
 
 from ..tools.registry import TOOLS, register_tool, to_openai_tools
 
-#: 线程局部：当前线程的编排者 host（提供 delegate_worker 方法）。
-_host = threading.local()
+#: 只传播到工具调度线程，不传播到工人 agent。
+_host: ContextVar[Any] = ContextVar("orchestrator_host", default=None)
 
 
-def _set_host(host: Any) -> None:
-    """设置当前线程的编排者 host（orchestrator.run 调用，结束后清除）。"""
-    _host.orchestrator = host
+def _set_host(host: Any) -> Token:
+    """设置编排者并返回恢复原上下文所需的 token。"""
+    return _host.set(host)
 
 
-def _clear_host() -> None:
-    try:
-        del _host.orchestrator
-    except AttributeError:
-        pass
+def _clear_host(token: Token) -> None:
+    _host.reset(token)
 
 
 def _current_host() -> Any:
-    return getattr(_host, "orchestrator", None)
+    return _host.get()
 
 
 #: 工具参数 schema（供 OpenAI 原生 tool_calls 渲染与参数校验）。
@@ -73,6 +70,8 @@ def register_worker_tool() -> None:
             "把子任务委派给一个独立的工人 agent 并行处理；工人与你共享工作目录，"
             "会自己调用工具完成任务，完成后返回结论。适合：可独立完成的子任务、"
             "需要并行推进的多条线索、独立调查/编码/审查。"
+            "将独立子任务放在同一轮连续的 delegate_agent 调用中以并行执行。"
+            "工人只读，修改建议以 patch 返回；所有写入由你等待工人结束后串行执行。"
         ),
         parameters=DELEGATE_PARAMETERS,
         risk="read",

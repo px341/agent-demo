@@ -2,7 +2,7 @@
 
 输入 / 输出契约见 contracts.py。模型输出走 OpenAI 原生 tool_calls 协议：
 每轮 ``llm.complete(messages, tools=...)`` 返回结构化 ``LLMResponse``，
-主循环按 ``tool_calls`` 执行（并行多调用一次执行），结果以 role=tool
+主循环按 ``tool_calls`` 批量执行（显式允许的只读调用可并行），结果以 role=tool
 消息回灌；无 tool_calls 的轮即最终答案。
 
 依赖通过 Protocol 注入：
@@ -19,6 +19,8 @@ query 为当前请求文本（记忆实现按相关性检索注入相关会话�
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from pathlib import Path
 from typing import Any, Callable
 
@@ -39,7 +41,7 @@ from .contracts import (
 )
 from .environment import build_environment_prompt
 from .errors import ToolError
-from .tools.registry import to_openai_tools
+from .tools.registry import TOOLS, to_openai_tools
 
 
 def step_to_messages(step: StepRecord) -> list[Message]:
@@ -138,6 +140,9 @@ class AgentLoop:
         #: 每轮发给 LLM 的工具 schema 提供者；None 时用全局注册表全量渲染。
         #: 多 agent 场景按角色裁剪（如工人不暴露 delegate_agent）时覆盖。
         self._tools_schema = tools_schema or to_openai_tools
+        # 默认串行；编排者只启用 delegate_agent 并发，写工具始终串行。
+        self.parallel_tool_names: frozenset[str] = frozenset()
+        self.max_parallel_tools = 1
 
     def _build_context_prompt(self, user_input: str) -> str:
         """拼接本次请求的系统提示：跨会话记忆 + 动态环境 prompt + 静态工具 prompt。
@@ -177,7 +182,7 @@ class AgentLoop:
         每轮流程：
 
         1. ``llm.complete(messages, tools=...)`` 得到结构化返回；
-        2. 有 ``tool_calls`` → 循环执行全部（并行，审批用 request_batch），
+        2. 有 ``tool_calls`` → 批量执行全部（审批用 request_batch），
            观察结果以 role=tool 回灌，进入下一轮；
         3. 无 ``tool_calls`` → ``text`` 即最终答案，正常返回；
         4. 超过 max_turns → 以 MAX_TURNS 收口；
@@ -249,7 +254,7 @@ class AgentLoop:
                     steps=steps,
                 )
 
-            # 工具轮：并行执行全部调用（审批用批量闸门）。
+            # 工具轮：批量调度，只有显式允许的连续只读调用可并行。
             calls: list[tuple[str, str, dict]] = []
             for call in result.tool_calls:
                 call_id = (call or {}).get("id")
@@ -301,7 +306,7 @@ class AgentLoop:
         )
 
     def _execute_tool_batch(
-        self, calls: list[tuple[str, dict]]
+        self, calls: list[tuple[str, str, dict]]
     ) -> tuple[list[str], list[CallOutcome], str | None]:
         """执行一批工具调用，返回 (观察文本, 结构化结果, 致命错误文本)。
 
@@ -309,7 +314,9 @@ class AgentLoop:
         工具抛 ToolError：
         - recoverable（Validation/NotFound）→ 记 error outcome，继续循环；
         - 不可恢复（Permission/Timeout/Execution/Approval）→ 记 error outcome，
-          整批终止：之前已成功的调用打 partial 标记，剩余调用记 skipped。
+          等待本组在途调用结束，成功项打 partial 标记，未启动项记 skipped。
+        仅连续且显式允许的只读调用分组并行（每组不超过 max_parallel_tools）；
+        其他工具逐个执行，并等待前组全部结束，因此写入不会与工人交错。
 
         结构化结果 CallOutcome 供 memory 存档与 summary 消费：
         错误带 error_type，部分执行带 partial=True。
@@ -349,72 +356,77 @@ class AgentLoop:
             return [o.observation for o in outcomes], outcomes, message
 
         outcomes: list[CallOutcome] = []
-        for index, (call_id, name, args) in enumerate(calls):
-            try:
-                observation = str(self.tools.execute(name, args))
-                outcomes.append(
+        index = 0
+        while index < len(calls):
+            end = index + 1
+            if self._can_parallelize(calls[index][1]):
+                while (
+                    end < len(calls)
+                    and end - index < self.max_parallel_tools
+                    and self._can_parallelize(calls[end][1])
+                ):
+                    end += 1
+            group = calls[index:end]
+            if len(group) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=len(group), thread_name_prefix="delegate-tool"
+                ) as pool:
+                    # 每个线程必须独立复制上下文；同一 Context 不可同时进入。
+                    futures = [
+                        pool.submit(copy_context().run, self._execute_tool_call, call)
+                        for call in group
+                    ]
+                    results = [future.result() for future in futures]
+            else:
+                results = [self._execute_tool_call(group[0])]
+            outcomes.extend(outcome for outcome, _ in results)
+            fatal = next((error for _, error in results if error is not None), None)
+            if fatal is not None:
+                for outcome in outcomes:
+                    if outcome.status == "success":
+                        outcome.partial = True
+                outcomes.extend(
                     CallOutcome(
                         tool_call_id=call_id,
-                        status="success",
-                        observation=observation,
-                    )
-                )
-            except ToolError as exc:
-                message = str(exc)
-                outcomes.append(
-                    CallOutcome(
-                        tool_call_id=call_id,
-                        status="error",
-                        observation=message,
-                        error_type=exc.error_type,
-                    )
-                )
-                if not exc.recoverable:
-                    # 不可恢复：之前已成功的调用打 partial，剩余 skipped。
-                    for prior in outcomes:
-                        if prior.status == "success":
-                            prior.partial = True
-                    for _ in range(index + 1, len(calls)):
-                        outcomes.append(
-                            CallOutcome(
-                                tool_call_id=None,
-                                status="skipped",
-                                observation=(
-                                    "ToolError[ExecutionError]: 未执行"
-                                    "（批被后续致命错误中断）"
-                                ),
-                                error_type="ExecutionError",
-                            )
-                        )
-                    return (
-                        [o.observation for o in outcomes],
-                        outcomes,
-                        message,
-                    )
-            except Exception as exc:
-                message = f"ToolError[ExecutionError]: 工具 {name} 执行失败：{exc}"
-                outcomes.append(
-                    CallOutcome(
-                        tool_call_id=None,
-                        status="error",
-                        observation=message,
+                        status="skipped",
+                        observation="ToolError[ExecutionError]: 未执行（批被致命错误中断）",
                         error_type="ExecutionError",
                     )
+                    for call_id, _, _ in calls[end:]
                 )
-                for prior in outcomes:
-                    if prior.status == "success":
-                        prior.partial = True
-                for _ in range(index + 1, len(calls)):
-                    outcomes.append(
-                        CallOutcome(
-                            tool_call_id=None,
-                            status="skipped",
-                            observation=(
-                                "ToolError[ExecutionError]: 未执行"
-                                "（批被后续致命错误中断）"
-                            ),
-                            error_type="ExecutionError",
-                        )
-                    )
-                return [o.observation for o in outcomes], outcomes, message
+                return [o.observation for o in outcomes], outcomes, fatal
+            index = end
         return [o.observation for o in outcomes], outcomes, None
+
+    def _can_parallelize(self, name: str) -> bool:
+        spec = TOOLS.get(name)
+        return (
+            self.max_parallel_tools > 1
+            and name in self.parallel_tool_names
+            and spec is not None
+            and spec.risk == "read"
+        )
+
+    def _execute_tool_call(
+        self, call: tuple[str, str, dict]
+    ) -> tuple[CallOutcome, str | None]:
+        call_id, name, args = call
+        try:
+            observation = str(self.tools.execute(name, args))
+            return CallOutcome(tool_call_id=call_id, observation=observation), None
+        except ToolError as exc:
+            message = str(exc)
+            return CallOutcome(
+                tool_call_id=call_id,
+                status="error",
+                observation=message,
+                error_type=exc.error_type,
+            ), None if exc.recoverable else message
+        except Exception as exc:
+            message = f"ToolError[ExecutionError]: 工具 {name} 执行失败：{exc}"
+            return CallOutcome(
+                tool_call_id=call_id,
+                status="error",
+                observation=message,
+                error_type="ExecutionError",
+            ), message
