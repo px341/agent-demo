@@ -327,7 +327,10 @@ class PathSafetyTest(unittest.TestCase):
         self.addCleanup(lambda: outside_dir.exists() and __import__("shutil").rmtree(outside_dir))
         (outside_dir / "secret.txt").write_text("secret")
         link = self.root / "link"
-        link.symlink_to(outside_dir, target_is_directory=True)
+        try:
+            link.symlink_to(outside_dir, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"当前平台不允许创建符号链接：{exc}")
 
         with self.assertRaises(ToolPermissionError) as ctx:
             self.executor.execute("read_file", {"path": "link/secret.txt"})

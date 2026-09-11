@@ -55,6 +55,21 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="工人并发上限（默认 4）",
     )
+    parser.add_argument(
+        "--one-shot",
+        "--one_shot",
+        dest="one_shot",
+        default=None,
+        metavar="TASK",
+        help="非交互执行一次任务后退出（适合脚本和评测）",
+    )
+    parser.add_argument(
+        "--auto-approve",
+        "--auto_approve",
+        dest="auto_approve",
+        action="store_true",
+        help="自动批准工作目录内的工具调用；仅建议在隔离评测目录使用",
+    )
     # 后续要加的其他参数在这里 add_argument(...)
     return parser
 

@@ -23,7 +23,7 @@ from myagent.contracts import (
     StepRecord,
     StopReason,
 )
-from myagent.cli import _print_response, _repl, _trim_history
+from myagent.cli import _one_shot, _print_response, _repl, _trim_history
 
 
 class FakeLoop:
@@ -62,6 +62,20 @@ def final_response(
 
 
 class CliReplTest(unittest.TestCase):
+    def test_one_shot_runs_once_without_input(self):
+        loop = FakeLoop([final_response("完成")])
+        with mock.patch("builtins.input") as prompt:
+            code = _one_shot(loop, "修复问题")
+        self.assertEqual(code, 0)
+        prompt.assert_not_called()
+        self.assertEqual(len(loop.requests), 1)
+        self.assertEqual(loop.requests[0].user_input, "修复问题")
+
+    def test_one_shot_rejects_empty_task(self):
+        loop = FakeLoop([])
+        self.assertEqual(_one_shot(loop, "  "), 2)
+        self.assertEqual(loop.requests, [])
+
     def test_exit_command(self):
         loop = FakeLoop([])
         with mock.patch("builtins.input", side_effect=["/exit"]):

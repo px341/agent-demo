@@ -17,6 +17,7 @@ from myagent.errors import (
     CommandError,
     ToolPermissionError,
     ToolTimeoutError,
+    ValidationError,
 )
 from myagent.tools import TOOLS, ToolExecutor
 
@@ -48,8 +49,9 @@ class ShellToolTest(unittest.TestCase):
             self.executor.execute("run_shell", {"command": "sudo ls"})
 
     def test_blacklist_pipeline(self):
-        with self.assertRaises(ToolPermissionError):
+        with self.assertRaises(ValidationError) as ctx:
             self.executor.execute("run_shell", {"command": "ls | grep py"})
+        self.assertTrue(ctx.exception.recoverable)
 
     def test_timeout(self):
         with self.assertRaises(ToolTimeoutError):

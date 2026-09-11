@@ -24,14 +24,71 @@ DEEPSEEK_API_KEY=sk-xxx
 DEEPSEEK_API_BASE=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 
+python -m pip install -e .
 python -m myagent            # 交互式多轮 REPL
 python -m myagent --cwd DIR  # 指定工作目录
 python -m myagent --no_memory # 不启用记忆（不存档、不注入跨会话记忆）
 python -m myagent --no_compose # 不启用上下文压缩（不裁剪 tool 输出、不丢弃历史）
 python -m myagent --multi_agent # 编排者-工人多 agent 模式（可配 --worker_prompt_dir / --max_workers）
+python -m myagent --one-shot "修复这个项目的失败测试" --auto-approve --no_memory
 ```
 
 REPL 内建命令：`/exit`、`/quit`。
+
+`--one-shot` 执行单个任务后退出，不读取标准输入。`--auto-approve` 会自动批准
+工作目录内的读写/删除工具，只应配合临时目录、容器或其他隔离工作区使用。
+
+## SWE-bench Lite
+
+项目提供 `python -m myagent.swebench` 批量生成 SWE-bench 标准 predictions
+JSONL。生成补丁与官方 Docker 评分是两个独立步骤。
+
+```bash
+python -m pip install -e ".[benchmark]"
+```
+
+### 1. 导出数据集
+
+Runner 接受 JSON 数组或 JSONL，每条记录至少包含 `instance_id`、`repo`、
+`base_commit`、`problem_statement`。如果已安装 Hugging Face `datasets`：
+
+```bash
+python -c "from datasets import load_dataset; load_dataset('princeton-nlp/SWE-bench_Lite', split='dev').to_json('swebench-lite-dev.jsonl')"
+```
+
+建议先从一个 dev 实例开始；runner 会从 GitHub 克隆对应仓库，所以生成阶段需要
+网络访问。每个实例都放在 `--work-root` 下的新目录，工具调用仅作用于该 checkout。
+
+```bash
+python -m myagent.swebench \
+  --dataset swebench-lite-dev.jsonl \
+  --predictions predictions/dev-smoke.jsonl \
+  --work-root .swebench-work \
+  --limit 1
+```
+
+中断后可以追加 `--resume`：已经写入 predictions 的实例会被跳过。也可用
+`--instance-id django__django-11049` 精确选择实例。
+
+### 2. 官方评分
+
+安装并启动 Docker、安装官方 `swebench` 后执行：
+
+```bash
+python -m myagent.swebench_eval \
+  --dataset_name SWE-bench/SWE-bench_Lite \
+  --split dev \
+  --predictions_path predictions/dev-smoke.jsonl \
+  --max_workers 1 \
+  --run_id myagent-dev-smoke
+```
+
+Windows 必须使用 `myagent.swebench_eval` 入口，它会确保挂载进 Linux 容器的
+`eval.sh` 与 patch 保持 LF 换行；直接调用官方模块会把脚本写成 CRLF。Linux/macOS
+也可使用该入口，它会原样委托给官方 harness。
+
+先确认单实例从生成到评分全链路通过，再逐步扩大 `--limit`。正式 test split 有
+300 个实例，会产生较多模型调用、克隆数据和 Docker 镜像。
 
 ## 模块清单
 

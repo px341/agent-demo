@@ -43,10 +43,11 @@ def run_case(
     if resp.final_answer:
         print("final:", resp.final_answer)
     for s in resp.steps:
-        obs = (s.observation or "")[:80]
+        obs = " | ".join(s.observations)[:80]
         raw = (s.raw_output or "").replace("\n", " ")[:150]
         print(f"  turn{s.turn}: {raw}")
-        print(f"           action={type(s.action).__name__} obs={obs!r}")
+        action = "tool_calls" if s.tool_calls else "final_answer"
+        print(f"           action={action} obs={obs!r}")
 
 
 def run_memory_case() -> None:

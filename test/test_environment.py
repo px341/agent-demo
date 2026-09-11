@@ -103,7 +103,10 @@ class WorkspaceTreeTest(unittest.TestCase):
             root = Path(tmp)
             (root / "real").mkdir()
             (root / "real" / "inner.py").write_text("")
-            (root / "loop").symlink_to(root, target_is_directory=True)
+            try:
+                (root / "loop").symlink_to(root, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"当前平台不允许创建符号链接：{exc}")
 
             tree = build_workspace_tree(root)
 

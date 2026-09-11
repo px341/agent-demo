@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myagent"
+version = "0.1.0"
+description = "A small ReAct coding agent with SWE-bench prediction support"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openai>=1.0",
+  "python-dotenv>=1.0",
+  "pyreadline3>=3.4; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+benchmark = ["datasets>=2.14", "swebench>=5.0"]
+
+[project.scripts]
+myagent = "myagent.cli:main"
+myagent-swebench = "myagent.swebench:main"
+myagent-swebench-eval = "myagent.swebench_eval:main"
+
+[tool.setuptools.package-data]
+myagent = ["prompts/*.md"]
+
+[tool.setuptools.packages.find]
+include = ["myagent*"]
+exclude = ["test*", "memories*"]

@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
-from ..errors import CommandError, ToolPermissionError, ToolTimeoutError
+from ..errors import CommandError, ToolPermissionError, ToolTimeoutError, ValidationError
 from .registry import register_tool
 
 #: 输出截断上限（工具层自限，防单条 tool 输出爆 max_tool_tokens）。
@@ -59,7 +60,9 @@ def _check_blacklist(tokens: list[str]) -> None:
     # 含管道/分号的组合命令同样黑名单拦截（避免绕过首个命令检查）。
     for token in tokens:
         if token in ("&&", "||", ";", "|", ">", ">>", "<"):
-            raise ToolPermissionError("组合命令（&& / | / ; 等）被禁止，请使用单个命令")
+            # 命令本身未越权，只是工具契约要求一次执行一个命令。作为可恢复
+            # 参数错误回灌，让 agent 拆分命令继续，而不是终止整个任务。
+            raise ValidationError("组合命令（&& / | / ; 等）不受支持，请拆成多个工具调用")
 
 
 @register_tool(
@@ -79,6 +82,10 @@ def run_shell(args: dict, cwd: Path) -> str:
         raise CommandError("命令为空")
     tokens = shlex.split(command)
     _check_blacklist(tokens)
+    # Windows 常把 python3/python 指向不可用的 Microsoft Store app alias。
+    # Agent 自身既已运行在 Python 中，子任务应复用同一个解释器，跨平台稳定。
+    if tokens[0] in {"python", "python3"}:
+        tokens[0] = sys.executable
 
     try:
         proc = subprocess.run(

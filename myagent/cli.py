@@ -78,6 +78,11 @@ def main() -> int:
     tools_executor = ToolExecutor(
         agent_params.cwd, timeout=agent_params.tool_timeout
     )
+    approval_gate = ConsoleApprovalGate(
+        auto_approve_risks={"read", "write", "delete"}
+        if args.auto_approve
+        else None
+    )
     if args.multi_agent:
         # 编排者-工人模式：编排者是完整的主 loop（记忆/压缩/审批照常），
         # 另注入 delegate_agent 委派工具；工人按角色提示词独立运行。
@@ -89,7 +94,7 @@ def main() -> int:
             tools=tools_executor,
             memory=memory,
             composer=composer,
-            approval_gate=ConsoleApprovalGate(),
+            approval_gate=approval_gate,
             worker_prompt_dir=args.worker_prompt_dir,
             max_workers=args.max_workers,
         )
@@ -98,16 +103,37 @@ def main() -> int:
             agent_params,
             llm=client,
             tools=tools_executor,
-            approval_gate=ConsoleApprovalGate(),
+            approval_gate=approval_gate,
             memory=memory,
             composer=composer,
         )
 
     try:
+        if args.one_shot is not None:
+            return _one_shot(loop, args.one_shot, memory)
         return _repl(loop, memory)
     finally:
         if args.multi_agent:
             loop.close()
+
+
+def _one_shot(
+    loop: AgentLoop,
+    user_input: str,
+    memory: MemoryManager | None = None,
+) -> int:
+    """非交互执行单个任务；供脚本、CI 与 benchmark runner 使用。"""
+    user_input = user_input.strip()
+    if not user_input:
+        print("任务内容不能为空。", file=sys.stderr)
+        return 2
+    if memory is not None:
+        memory.append_message(Message(role="user", content=user_input))
+    response = loop.run(AgentRequest(user_input=user_input))
+    if memory is not None:
+        _archive_steps(memory, response)
+        memory.close_session()
+    return _print_response(response)
 
 
 def _sweep_memory(memory: MemoryManager) -> None:
@@ -213,13 +239,13 @@ def _trim_history(history: list[Message], limit: int = MAX_HISTORY_MESSAGES) -> 
 def _print_response(response: AgentResponse) -> int:
     """按结束原因打印主循环结果，返回进程退出码。"""
     if response.stop_reason is StopReason.FINAL_ANSWER:
-        print(f"🤖 {response.final_answer}")
+        print(f"回答：{response.final_answer}")
         return 0
     if response.stop_reason is StopReason.MAX_TURNS:
-        print(f"⚠️ 达到轮数上限（{response.turns_used} 轮），已停止。")
+        print(f"警告：达到轮数上限（{response.turns_used} 轮），已停止。")
         return 1
     if response.stop_reason is StopReason.TOOL_ERROR:
-        print(f"⛔ 工具错误，本轮任务终止：{response.error}")
+        print(f"工具错误，本轮任务终止：{response.error}")
         return 1
-    print(f"❌ 出错：{response.error}")
+    print(f"出错：{response.error}")
     return 1
