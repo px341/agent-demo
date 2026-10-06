@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
   "openai>=1.0",
   "python-dotenv>=1.0",
+  "tiktoken>=0.7",
   "pyreadline3>=3.4; platform_system == 'Windows'",
 ]
 

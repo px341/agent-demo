@@ -40,6 +40,55 @@ REPL 内建命令：`/exit`、`/quit`。
 
 ## SWE-bench Lite
 
+### WSL 环境与单实例冒烟脚本
+
+在 Ubuntu-24.04 的项目目录内执行：
+
+```bash
+python3 -m venv agentvenv
+source agentvenv/bin/activate
+python -m pip install -e ".[benchmark]"
+```
+
+Docker Desktop 需要在 Settings → Resources → WSL Integration 中启用
+Ubuntu-24.04。在 WSL 内用 `docker info` 确认连接成功，详见
+[Docker 官方 WSL 集成说明](https://docs.docker.com/desktop/features/wsl/)。
+
+参考 `.env.example` 创建本地 `.env.llm`，填写 API key 和模型；该文件被 Git
+忽略。先将官方 Lite dev 数据集导出到
+`.swebench-work/data/swebench-lite-dev.jsonl`，数据集不纳入版本控制：
+
+```bash
+mkdir -p .swebench-work/data
+python -c "from datasets import load_dataset; load_dataset('SWE-bench/SWE-bench_Lite', split='dev').to_json('.swebench-work/data/swebench-lite-dev.jsonl')"
+```
+
+检查依赖、数据集、分词器及 Docker；此命令不调用模型，也不执行评分：
+
+```bash
+bash scripts/swebench-smoke.sh check
+```
+
+模型配置完成后，生成并评分一个 dev 实例：
+
+```bash
+bash scripts/swebench-smoke.sh all
+```
+
+脚本会打印唯一 run ID，补丁和评分报告保存在
+`.swebench-work/runs/<run-id>/`，官方详细日志保存在 `logs/`。也可以分步运行：
+
+```bash
+bash scripts/swebench-smoke.sh generate myagent-dev-smoke-001
+bash scripts/swebench-smoke.sh eval myagent-dev-smoke-001
+```
+
+每次新评测请换一个 run ID，避免覆盖补丁或复用官方评分缓存。
+`MYAGENT_PYTHON` 环境变量可指定其他 Python 环境，默认使用
+`agentvenv/bin/python`。单实例结果用于验证流程，不代表完整基准的解决率。
+生成阶段固定只跑 1 个实例，最多 30 轮模型调用；该脚本没有金额预算保护，
+调用费用由实际 token 用量决定。
+
 项目提供 `python -m myagent.swebench` 批量生成 SWE-bench 标准 predictions
 JSONL。生成补丁与官方 Docker 评分是两个独立步骤。
 

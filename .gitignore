@@ -1,4 +1,5 @@
 .venv/
+agentvenv/
 .idea/
 .vscode/
 __pycache__/
