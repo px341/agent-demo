@@ -155,6 +155,12 @@ bash scripts/swebench-smoke.sh all --limit 50 --budget-cny 150 --batch-seconds 2
 解决率按本次选定题数统计；少量实例的结果应标注样本范围，不能当作完整
 Verified Mini 的 50 题得分。数据、预测、日志、虚拟环境和 `.env.llm` 都被 Git 忽略。
 
+### 最近一次 Mini 全量报告
+
+2026-10-07 的 50 题运行结果为 **41/50（82%）**：8 题非空补丁未通过，1 题为空补丁，评分错误为 0。
+配置、耗时、调用统计、逐题结果及官方 JSON 见
+[完整报告](docs/benchmarks/2026-10-07-verified-mini/README.md)。
+
 ### 其他 SWE-bench 数据集
 
 通用 `python -m myagent.swebench` 和 `python -m myagent.swebench_eval` 入口仍可
