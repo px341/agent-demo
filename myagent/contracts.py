@@ -55,6 +55,7 @@ class LLMResponse:
     text: str
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    finish_reason: str | None = None
 
 
 class ToolExecutor(Protocol):
@@ -258,3 +259,4 @@ class AgentResponse:
 
     #: stop_reason=ERROR 时的异常信息。
     error: str | None = None
+    verification: dict[str, Any] = field(default_factory=dict)

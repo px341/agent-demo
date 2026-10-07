@@ -8,6 +8,7 @@ writes the standard predictions JSONL format accepted by SWE-bench.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -20,24 +21,8 @@ from .agent_config import AgentParams
 from .agent_loop import AgentLoop
 from .context import ContextComposer
 from .contracts import AgentRequest, AgentResponse, LLMClient, StopReason
-from .errors import ToolPermissionError, ValidationError
 from .provider import OpenAICompatibleModelClient
-from .tools import ToolExecutor
-
-
-class BenchmarkToolExecutor:
-    """Keep the sandbox boundary but let the model recover from denied calls."""
-
-    def __init__(self, cwd: Path, timeout: float | None):
-        self.inner = ToolExecutor(cwd, timeout=timeout)
-
-    def execute(self, name: str, args: dict[str, Any]) -> str:
-        try:
-            return self.inner.execute(name, args)
-        except ToolPermissionError as exc:
-            raise ValidationError(
-                f"该操作被评测沙箱拒绝，请只使用当前 checkout 内的安全路径/命令：{exc}"
-            ) from exc
+from .benchmark_container import DockerSandbox, benchmark_schema, load_environments
 
 
 TASK_TEMPLATE = """You are solving one SWE-bench issue in an isolated checkout.
@@ -46,16 +31,25 @@ Issue:
 {problem_statement}
 
 Inspect the repository, implement the smallest correct fix, and run relevant
-tests when possible. Work directly in the checkout using the provided tools.
+tests. All tools run inside an offline Docker container at /testbed. Bash pipes
+and redirections work. Python and task dependencies are already prepared.
+Search within /testbed (use rg or find .); do not search the entire filesystem.
+Work directly in the checkout using the provided tools.
 Do not merely describe a patch and do not commit changes. End with a concise
-summary after the implementation is complete. Do not download dependencies,
-reference wheels, or create scratch/reproduction files inside the repository;
-use existing tests and source files. SWE-bench Lite solutions modify tracked
-files, so finish by editing the actual implementation rather than adding notes.
+summary after checking git diff and relevant test results. Add new implementation
+or test files when needed; remove temporary reproduction artifacts before finishing.
+Do not download dependencies or reference fixes. An empty patch is undelivered.
 """
 
 
-def load_instances(path: Path) -> list[dict[str, Any]]:
+GENERATION_FIELDS = {"instance_id", "repo", "base_commit", "problem_statement"}
+
+
+def generation_record(record: dict) -> dict:
+    return {key: record[key] for key in sorted(GENERATION_FIELDS)}
+
+
+def load_instances(path: Path, *, generation_only: bool = False) -> list[dict[str, Any]]:
     """Load a JSON array or JSONL dataset export and validate required fields."""
     text = path.read_text(encoding="utf-8")
     stripped = text.lstrip()
@@ -75,7 +69,7 @@ def load_instances(path: Path) -> list[dict[str, Any]]:
         missing = sorted(required - record.keys())
         if missing:
             raise ValueError(f"instance {index} is missing: {', '.join(missing)}")
-    return records
+    return [generation_record(row) for row in records] if generation_only else records
 
 
 def _run_git(args: list[str], *, cwd: Path | None = None) -> str:
@@ -114,9 +108,18 @@ def prepare_checkout(instance: dict[str, Any], work_root: Path) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         raise ValueError(f"invalid GitHub repo: {repo!r}")
     url = f"https://github.com/{repo}.git"
+    base_commit = str(instance["base_commit"])
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", base_commit):
+        raise ValueError("base_commit must be a full commit SHA")
     try:
-        _run_git(["clone", "--quiet", "--no-checkout", url, str(checkout)])
-        _run_git(["checkout", "--quiet", "--detach", str(instance["base_commit"])], cwd=checkout)
+        # Fetch only the task snapshot. A full clone exposes later repair commits,
+        # which an agent can recover with git log --all / git show.
+        checkout.mkdir()
+        _run_git(["init", "--quiet"], cwd=checkout)
+        _run_git(["config", "core.autocrlf", "false"], cwd=checkout)
+        _run_git(["fetch", "--quiet", "--no-tags", "--depth=1", url, base_commit], cwd=checkout)
+        _run_git(["checkout", "--quiet", "--detach", base_commit], cwd=checkout)
+        (checkout / ".git/FETCH_HEAD").unlink(missing_ok=True)
     except Exception:
         # Only remove the exact fresh checkout created by this function.
         if checkout.exists() and checkout.parent == work_root:
@@ -126,13 +129,15 @@ def prepare_checkout(instance: dict[str, Any], work_root: Path) -> Path:
 
 
 def capture_patch(checkout: Path) -> str:
-    """Return the tracked binary-safe diff expected by SWE-bench Lite.
-
-    Lite instances do not require creating files. Excluding untracked files also
-    prevents temporary downloads and reproduction artifacts from contaminating
-    a prediction.
-    """
-    return _run_git(["diff", "--binary", "--no-ext-diff", "HEAD"], cwd=checkout)
+    """Collect tracked changes and non-ignored new files via a temporary index."""
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as temporary:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        for args in (["read-tree", "HEAD"], ["add", "-A", "--", "."]):
+            subprocess.run(["git", *args], cwd=checkout, env=env, check=True, capture_output=True, timeout=60)
+        return subprocess.run(["git", "diff", "--cached", "--binary", "--no-ext-diff", "HEAD"],
+                              cwd=checkout, env=env, check=True, capture_output=True, text=True, timeout=60).stdout
 
 
 def run_instance(
@@ -140,19 +145,30 @@ def run_instance(
     checkout: Path,
     llm: LLMClient,
     *,
-    max_turns: int = 30,
-    tool_timeout: float | None = 600,
+    max_turns: int = 80,
+    max_output_tokens: int = 16384,
+    tool_timeout: float = 60,
+    environment: dict | None = None,
+    sandbox=None,
+    instance_seconds: float = 1800,
 ) -> tuple[dict[str, str], AgentResponse]:
     """Run one isolated instance and return an official prediction record."""
+    if sandbox is None:
+        if environment is None:
+            raise ValueError("An audited Docker environment is required; host tools are disabled")
+        sandbox = DockerSandbox(checkout, environment, timeout=tool_timeout, instance_seconds=instance_seconds)
     params = AgentParams(
-        cwd=str(checkout),
+        cwd="/testbed",
         max_turns=max_turns,
+        max_output_tokens=max_output_tokens,
         tool_timeout=tool_timeout,
     )
     loop = AgentLoop(
         params,
         llm=llm,
-        tools=BenchmarkToolExecutor(checkout, timeout=tool_timeout),
+        tools=sandbox,
+        tools_schema=benchmark_schema,
+        environment_prompt=f"Offline task container. Working directory: /testbed. Environment check: {sandbox.preflight}",
         # No approval gate: the checkout is created solely for this instance.
         approval_gate=None,
         composer=ContextComposer(
@@ -162,9 +178,34 @@ def run_instance(
             max_total_tool_tokens=params.max_total_tool_tokens,
         ),
     )
+    loop.system_prompt = "You are a coding agent. Use the supplied container tools to implement and verify the issue. All tool actions are authorized inside the disposable task container."
     task = TASK_TEMPLATE.format(problem_statement=instance["problem_statement"])
-    response = loop.run(AgentRequest(user_input=task))
-    patch = capture_patch(checkout)
+    try:
+        from .benchmark_checks import isolation_check
+        isolation_check(sandbox)
+        response = loop.run(AgentRequest(user_input=task))
+        from .errors import ToolError
+        try:
+            response.verification["git_status"] = sandbox.execute("git_status", {})
+            response.verification["git_diff"] = sandbox.execute("git_diff", {})
+            test_observations = []
+            for step in response.steps:
+                for index, call in enumerate(step.tool_calls):
+                    function = call["function"]
+                    arguments = json.loads(function["arguments"] or "{}")
+                    if function["name"] == "run_shell" and re.search(r"\bpytest\b|\bunittest\b|runtests\.py", arguments.get("command", "")):
+                        test_observations.append({"command": arguments["command"],
+                                                  "result": step.observations[index]})
+            response.verification["agent_test_runs"] = test_observations
+            smoke_command = getattr(sandbox, "spec", {}).get("smoke_command")
+            if not test_observations and smoke_command:
+                response.verification["fallback_test_command"] = smoke_command
+                response.verification["fallback_test_result"] = sandbox.execute("run_shell", {"command": smoke_command})
+        except ToolError as exc:
+            response.verification["error"] = str(exc)
+        patch = sandbox.capture_patch()
+    finally:
+        sandbox.close()
     model_name = getattr(llm, "model", llm.__class__.__name__)
     prediction = {
         "instance_id": str(instance["instance_id"]),
@@ -201,8 +242,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-root", required=True, type=Path, help="fresh isolated checkouts directory")
     parser.add_argument("--instance-id", action="append", default=[], help="only run this instance (repeatable)")
     parser.add_argument("--limit", type=int, default=None, help="maximum number of instances")
-    parser.add_argument("--max-turns", type=int, default=30)
-    parser.add_argument("--tool-timeout", type=float, default=600)
+    parser.add_argument("--environments", required=True, type=Path)
+    parser.add_argument("--max-turns", type=int, default=80)
+    parser.add_argument("--max-output-tokens", type=int, default=16384)
+    parser.add_argument("--tool-timeout", type=float, default=60)
+    parser.add_argument("--instance-seconds", type=float, default=1800)
     parser.add_argument("--resume", action="store_true", help="skip IDs already present in predictions")
     return parser
 
@@ -211,7 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.limit is not None and args.limit < 1:
         raise SystemExit("--limit must be at least 1")
-    records = load_instances(args.dataset)
+    records = load_instances(args.dataset, generation_only=True)
+    environments = load_environments(args.environments)
     wanted = set(args.instance_id)
     records = _select_instances(records, wanted, args.limit)
     if wanted:
@@ -225,7 +270,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.predictions.exists() and not args.resume:
         raise SystemExit("predictions file already exists; use a new path or --resume")
 
-    client = OpenAICompatibleModelClient(AgentParams())
+    client = OpenAICompatibleModelClient(AgentParams(max_output_tokens=args.max_output_tokens))
     failures = 0
     with args.predictions.open("a", encoding="utf-8", newline="\n") as output:
         for index, instance in enumerate(records, 1):
@@ -242,8 +287,11 @@ def main(argv: list[str] | None = None) -> int:
                     client,
                     max_turns=args.max_turns,
                     tool_timeout=args.tool_timeout,
+                    max_output_tokens=args.max_output_tokens,
+                    instance_seconds=args.instance_seconds,
+                    environment=environments[instance_id],
                 )
-                if response.stop_reason is not StopReason.FINAL_ANSWER:
+                if response.stop_reason is not StopReason.FINAL_ANSWER or not prediction["model_patch"]:
                     failures += 1
                     print(
                         f"  warning: agent stopped with {response.stop_reason.value} "
@@ -266,6 +314,11 @@ def main(argv: list[str] | None = None) -> int:
                 }
             output.write(json.dumps(prediction, ensure_ascii=False) + "\n")
             output.flush()
+            receipt = {"instance_id": instance_id,
+                       "patch_sha256": hashlib.sha256(prediction["model_patch"].encode()).hexdigest(),
+                       "delivery_status": "delivered" if prediction["model_patch"] else "undelivered_empty_patch"}
+            with args.predictions.with_suffix(".receipts.jsonl").open("a", encoding="utf-8") as receipts:
+                receipts.write(json.dumps(receipt) + "\n")
     print(f"wrote {args.predictions}; generation_failures={failures}")
     return 1 if failures else 0
 

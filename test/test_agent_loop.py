@@ -82,6 +82,36 @@ def make_loop(
 
 
 class AgentLoopTest(unittest.TestCase):
+    def test_empty_and_truncated_text_are_not_completion(self):
+        llm = FakeLLM([LLMResponse(text="", finish_reason="stop"),
+                       LLMResponse(text="partial", finish_reason="length"), "done"])
+        result = make_loop(llm, max_turns=3).run(AgentRequest(user_input="fix"))
+        self.assertEqual(result.turns_used, 3)
+        self.assertEqual(result.final_answer, "done")
+        self.assertTrue(all(s.final_answer is None for s in result.steps[:2]))
+
+    def test_length_rejects_even_parseable_tool_calls(self):
+        tools = FakeTools()
+        llm = FakeLLM([LLMResponse(text="", tool_calls=[tc("write_file", {"path": "a", "content": "b"})],
+                                  finish_reason="length"), "done"])
+        result = make_loop(llm, tools=tools).run(AgentRequest(user_input="fix"))
+        self.assertEqual(tools.calls, [])
+        self.assertEqual(result.tool_calls, 0)
+        self.assertEqual(result.steps[0].assistant_metadata["finish_reason"], "length")
+
+    def test_one_malformed_call_rejects_entire_batch(self):
+        tools = FakeTools()
+        bad = tc("write_file", {})
+        bad["function"]["arguments"] = '{"path":'
+        llm = FakeLLM([LLMResponse(text="", tool_calls=[tc("write_file", {"path": "a", "content": "b"}), bad]), "done"])
+        make_loop(llm, tools=tools).run(AgentRequest(user_input="fix"))
+        self.assertEqual(tools.calls, [])
+
+    def test_repeated_empty_responses_exhaust_turns(self):
+        result = make_loop(FakeLLM([], fallback=""), max_turns=2).run(AgentRequest(user_input="fix"))
+        self.assertEqual(result.stop_reason, StopReason.MAX_TURNS)
+        self.assertIsNone(result.final_answer)
+
     def test_final_answer_direct(self):
         llm = FakeLLM(["42"])
         loop = make_loop(llm)
@@ -388,7 +418,7 @@ class AgentLoopTest(unittest.TestCase):
             self.assertEqual(tool["type"], "function")
 
     def test_invalid_arguments_json_handled(self):
-        """arguments 不是合法 JSON 时按空参数执行，不崩溃。"""
+        """Malformed arguments are rejected without executing any tools."""
         tools = FakeTools("结果")
         llm = FakeLLM(
             [
@@ -408,7 +438,7 @@ class AgentLoopTest(unittest.TestCase):
         loop = make_loop(llm, tools=tools)
         resp = loop.run(AgentRequest(user_input="任务"))
         self.assertEqual(resp.stop_reason, StopReason.FINAL_ANSWER)
-        self.assertEqual(tools.calls, [("read_file", {})])
+        self.assertEqual(tools.calls, [])
 
     def test_history_preserved_and_untouched(self):
         history = [Message(role="user", content="旧消息")]

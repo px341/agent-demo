@@ -128,6 +128,7 @@ class AgentLoop:
         composer: ContextComposer | None = None,
         approval_gate: ApprovalGate | None = None,
         tools_schema: Callable[[], list[dict[str, Any]]] | None = None,
+        environment_prompt: str | None = None,
     ):
         self.agent_params = agent_params
         self.llm = llm
@@ -135,6 +136,7 @@ class AgentLoop:
         self.memory = memory
         self.composer = composer
         self.approval_gate = approval_gate
+        self.environment_prompt = environment_prompt
         self.cwd = Path(agent_params.cwd).resolve()
         self.system_prompt = self._load_system_prompt()
         #: 每轮发给 LLM 的工具 schema 提供者；None 时用全局注册表全量渲染。
@@ -155,7 +157,7 @@ class AgentLoop:
         if self.memory is not None:
             memory_block = self.memory.context_block(query=user_input)
 
-        environment = build_environment_prompt(
+        environment = self.environment_prompt if self.environment_prompt is not None else build_environment_prompt(
             self.agent_params.prompt_dir,
             self.cwd,
         )
@@ -235,6 +237,33 @@ class AgentLoop:
                     steps=steps,
                     error=str(exc),
                 )
+
+            invalid = None
+            if result.finish_reason == "length":
+                invalid = "Response truncated (finish_reason=length). No tools were executed. Retry with a smaller complete response."
+            elif not result.tool_calls and not result.text.strip():
+                invalid = "Empty response is not completion. Continue implementing and testing."
+            elif result.finish_reason not in {None, "stop", "tool_calls"}:
+                invalid = f"Response did not complete (finish_reason={result.finish_reason}). Retry."
+            else:
+                for call in result.tool_calls:
+                    try:
+                        function = call["function"]
+                        if not isinstance(function, dict):
+                            raise ValueError("function must be an object")
+                        if not call.get("id") or not isinstance(function.get("name"), str):
+                            raise ValueError("missing tool ID/name")
+                        if not isinstance(json.loads(function.get("arguments") or "{}"), dict):
+                            raise ValueError("arguments must be an object")
+                    except (KeyError, TypeError, ValueError):
+                        invalid = "Invalid or incomplete tool arguments. No tools in this response were executed; resend valid JSON."
+                        break
+            if invalid:
+                steps.append(StepRecord(turn=turn, raw_output=result.text,
+                                        assistant_metadata={**result.metadata, "finish_reason": result.finish_reason,
+                                                            "rejected_response": invalid}))
+                messages.append(Message(role="user", content=invalid))
+                continue
 
             if not result.tool_calls:
                 # 无工具调用 = 本轮即最终答案。

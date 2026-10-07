@@ -34,6 +34,7 @@ class FakeCompletions:
         self.reasoning = reasoning
         self.via_model_extra = via_model_extra
         self.tool_calls = None
+        self.finish_reason = "stop"
         self.kwargs: dict | None = None
 
     def create(self, **kwargs):
@@ -50,7 +51,7 @@ class FakeCompletions:
                 msg.reasoning_content = self.reasoning
         if self.tool_calls is not None:
             msg.tool_calls = self.tool_calls
-        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason=self.finish_reason)])
 
 
 def make_client(
@@ -128,6 +129,11 @@ class ProviderCompleteTest(unittest.TestCase):
         client, _ = make_client("最终输出")
         resp = client.complete([Message(role="user", content="hi")])
         self.assertEqual(resp.text, "最终输出")
+
+    def test_finish_reason_passes_through(self):
+        client, fake = make_client("partial")
+        fake.finish_reason = "length"
+        self.assertEqual(client.complete([Message(role="user", content="hi")]).finish_reason, "length")
 
     def test_reasoning_content_extracted(self):
         """thinking mode 的 reasoning_content 应提取进 LLMResponse.metadata。"""

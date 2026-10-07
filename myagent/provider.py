@@ -111,4 +111,5 @@ class OpenAICompatibleModelClient:
                 }
                 for call in message.tool_calls
             ]
-        return LLMResponse(text=text, tool_calls=tool_calls, metadata=metadata)
+        return LLMResponse(text=text, tool_calls=tool_calls, metadata=metadata,
+                           finish_reason=getattr(response.choices[0], "finish_reason", None))

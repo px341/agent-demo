@@ -38,106 +38,130 @@ REPL 内建命令：`/exit`、`/quit`。
 `--one-shot` 执行单个任务后退出，不读取标准输入。`--auto-approve` 会自动批准
 工作目录内的读写/删除工具，只应配合临时目录、容器或其他隔离工作区使用。
 
-## SWE-bench Lite
+## SWE-bench Verified Mini（默认评测环境）
 
-### WSL 环境与单实例冒烟脚本
+默认使用社区的
+[SWE-bench Verified Mini](https://huggingface.co/datasets/MariusHobbhahn/swe-bench-verified-mini)
+test split，共 50 个固定实例，Mini 数据版本锁定为
+`b316c349947c29963fce3f4a65967c9807a4b673`。默认只检查环境，后续显式运行时
+默认选择原始顺序的前 3 个实例，不会自动跑完 50 题。
 
-在 Ubuntu-24.04 的项目目录内执行：
+### 1. 安装和准备数据
+
+在 Ubuntu-24.04 的项目目录中执行：
 
 ```bash
 python3 -m venv agentvenv
 source agentvenv/bin/activate
 python -m pip install -e ".[benchmark]"
+bash scripts/swebench-smoke.sh prepare
 ```
+
+`prepare` 下载 Mini 数据及官方 Verified 数据，按 Mini 的 50 个实例 ID 补齐
+当前 `swebench` 评分器需要的 `image`、`eval_script`、`log_parser`、`eval_type`
+字段，并核对仓库、基础提交和题目文本。生成导出仅保留 `instance_id`、`repo`、
+`base_commit`、`problem_statement`，放在 `.swebench-work/data/`；含答案与隐藏测试
+信息的评分数据单独放在 `.swebench-work/scoring/`。准备数据不会调用模型、克隆题目仓库、
+拉取 Docker 镜像或启动评分容器。
 
 Docker Desktop 需要在 Settings → Resources → WSL Integration 中启用
-Ubuntu-24.04。在 WSL 内用 `docker info` 确认连接成功，详见
-[Docker 官方 WSL 集成说明](https://docs.docker.com/desktop/features/wsl/)。
+Ubuntu-24.04，详见 [Docker 官方说明](https://docs.docker.com/desktop/features/wsl/)。
+参考 `.env.example` 创建本地 `.env.llm`，填写自己的模型配置；预算模式目前支持
+官方 `api.deepseek.com` 的 `deepseek-flash` / `deepseek-v4-flash`。
+`MYAGENT_PYTHON` 可指定其他 Python 环境，默认是 `agentvenv/bin/python`。
 
-参考 `.env.example` 创建本地 `.env.llm`，填写 API key 和模型；该文件被 Git
-忽略。先将官方 Lite dev 数据集导出到
-`.swebench-work/data/swebench-lite-dev.jsonl`，数据集不纳入版本控制：
-
-```bash
-mkdir -p .swebench-work/data
-python -c "from datasets import load_dataset; load_dataset('SWE-bench/SWE-bench_Lite', split='dev').to_json('.swebench-work/data/swebench-lite-dev.jsonl')"
-```
-
-检查依赖、数据集、分词器及 Docker；此命令不调用模型，也不执行评分：
+### 2. 只检查，不运行评测
 
 ```bash
+bash scripts/swebench-smoke.sh
+# 或明确指定 check
 bash scripts/swebench-smoke.sh check
 ```
 
-模型配置完成后，生成并评分一个 dev 实例：
+检查 50 个实例的数据校验和、评分器字段、分词器与 Docker 连接，打印后续选定
+实例和预算。此命令不会调用模型、拉取镜像或执行评分。
+
+### 3. 先验证容器隔离，再运行模型
 
 ```bash
-bash scripts/swebench-smoke.sh all
+# 从官方环境镜像提取运行时与依赖，清除源码、Git、缓存和评分残留，并导入新镜像
+bash scripts/swebench-smoke.sh prepare-environments --limit 3
+# 不调用模型：逐题检查镜像、宿主访问隔离、编辑、管道与现有测试
+bash scripts/swebench-smoke.sh isolation-check --limit 3
 ```
 
-脚本会打印唯一 run ID，补丁和评分报告保存在
-`.swebench-work/runs/<run-id>/`，官方详细日志保存在 `logs/`。也可以分步运行：
+每题的所有工具都在独立 Docker 容器内运行，无宿主目录挂载，网络为 `none`，
+不提供 Docker socket 或 API 密钥。模型请求由宿主控制器发送。基础源码按
+Git 的已跟踪文件清单传入容器，再建立只有一个基础提交的 Git 仓库。容器内 Bash 支持
+管道和重定向；Python、文件读写及 Git 工具都在相同容器中执行。详见
+[隔离与重测说明](docs/benchmark-isolation.md)。
+
+以下是后续运行命令；环境准备不会自动执行它们：
 
 ```bash
-bash scripts/swebench-smoke.sh generate myagent-dev-smoke-001
-bash scripts/swebench-smoke.sh eval myagent-dev-smoke-001
+# 生成并评分默认的 3 题，整批保守估算预算为 2 元
+bash scripts/swebench-smoke.sh all --run-id verified-mini-smoke-001
+
+# 或分步生成、评分
+bash scripts/swebench-smoke.sh generate --run-id verified-mini-smoke-002
+bash scripts/swebench-smoke.sh eval --run-id verified-mini-smoke-002
 ```
 
-每次新评测请换一个 run ID，避免覆盖补丁或复用官方评分缓存。
-`MYAGENT_PYTHON` 环境变量可指定其他 Python 环境，默认使用
-`agentvenv/bin/python`。单实例结果用于验证流程，不代表完整基准的解决率。
-生成阶段固定只跑 1 个实例，最多 30 轮模型调用；该脚本没有金额预算保护，
-调用费用由实际 token 用量决定。
+默认限制：最多 3 个实例，每题最多 80 轮，每次最多输出 16384 tokens，低思考
+强度，SDK 自动重试关闭。整批共享 `--budget-cny 2`，按已核对的
+[Flash 官方高峰价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)
+保守估算输入、输出费用；发送下一次请求前预留其费用，无法覆盖时停止。
+该额度不是平台账单的硬限额，价格变化时需要更新代码里的费率。默认每题
+1800 秒、整批 7200 秒、工具命令 60 秒；可显式调整时间上限。
 
-项目提供 `python -m myagent.swebench` 批量生成 SWE-bench 标准 predictions
-JSONL。生成补丁与官方 Docker 评分是两个独立步骤。
+`finish_reason=length`、空响应及不完整的工具参数均不会计为完成；截断工具
+调用不执行。超时终止命令进程组，并重启容器以清理其他后代进程；最多允许
+2 次恢复，之后停止该题。空补丁记为 `undelivered_empty_patch`。
+
+可用 `--limit 1` 缩小范围，或用可重复的 `--instance-id` 选择具体的 Mini
+实例。调整规模与预算必须显式传参，预算不足时不会自动提高额度或重跑。
+每题完成或中止后立即保存预测；未尝试的题记录在汇总中，之后可用具体
+`--instance-id` 和新的 run ID 补跑。预算中断不能视为完整的解题能力评测。
+
+明确运行全量 50 题时，可使用：
 
 ```bash
-python -m pip install -e ".[benchmark]"
+bash scripts/swebench-smoke.sh all --limit 50 --budget-cny 150 --batch-seconds 21600 --run-id verified-mini-full-001
 ```
 
-### 1. 导出数据集
+全量示例显式设置 6 小时生成上限；默认的 2 小时上限更适合小批试跑。
 
-Runner 接受 JSON 数组或 JSONL，每条记录至少包含 `instance_id`、`repo`、
-`base_commit`、`problem_statement`。如果已安装 Hugging Face `datasets`：
+这里的 150 元是按所有输入缓存未命中高峰价计算的保守估算保护额度，不代表
+实际费用；缓存命中和时段折扣可能显著降低实际扣费。
 
-```bash
-python -c "from datasets import load_dataset; load_dataset('princeton-nlp/SWE-bench_Lite', split='dev').to_json('swebench-lite-dev.jsonl')"
-```
+全量运行前也需先用 `--limit 50` 准备环境并通过隔离检查；生成入口会重新检查
+选定题目的隔离与现有测试，失败时不发送模型请求。正式得分需用统一配置
+重新生成全部 50 题。此前完整 clone 或宿主工具执行产生的结果不能作为该
+配置的正式成绩。官方公开镜像拉取遇到 WSL 的 Docker 凭据助手故障时，
+评分入口会尝试匿名拉取该公开镜像。
 
-建议先从一个 dev 实例开始；runner 会从 GitHub 克隆对应仓库，所以生成阶段需要
-网络访问。每个实例都放在 `--work-root` 下的新目录，工具调用仅作用于该 checkout。
+每次运行使用新 run ID，结果保存到 `.swebench-work/runs/<run-id>/`：
 
-```bash
-python -m myagent.swebench \
-  --dataset swebench-lite-dev.jsonl \
-  --predictions predictions/dev-smoke.jsonl \
-  --work-root .swebench-work \
-  --limit 1
-```
+| 文件 | 内容 |
+|---|---|
+| `dataset.jsonl` | 仅含生成字段的选题快照 |
+| `predictions.jsonl` | 逐题保存的模型补丁 |
+| `usage.jsonl` | 逐次模型调用的 tokens、耗时和保守费用估算 |
+| `generation-summary.json` | 每题交付状态、补丁哈希、预测文件哈希、耗时、费用及未尝试实例 |
+| `evaluation/dataset.jsonl` | 生成结束并校验预测文件哈希后才创建的评分快照 |
+| `evaluation-timing.json` | 官方评分阶段用时和退出码 |
+| `<model>.<run-id>.json` | 官方汇总评分；详细测试日志在项目 `logs/` 中 |
 
-中断后可以追加 `--resume`：已经写入 predictions 的实例会被跳过。也可用
-`--instance-id django__django-11049` 精确选择实例。
+解决率按本次选定题数统计；少量实例的结果应标注样本范围，不能当作完整
+Verified Mini 的 50 题得分。数据、预测、日志、虚拟环境和 `.env.llm` 都被 Git 忽略。
 
-### 2. 官方评分
+### 其他 SWE-bench 数据集
 
-安装并启动 Docker、安装官方 `swebench` 后执行：
-
-```bash
-python -m myagent.swebench_eval \
-  --dataset_name SWE-bench/SWE-bench_Lite \
-  --split dev \
-  --predictions_path predictions/dev-smoke.jsonl \
-  --max_workers 1 \
-  --run_id myagent-dev-smoke
-```
-
-Windows 必须使用 `myagent.swebench_eval` 入口，它会确保挂载进 Linux 容器的
-`eval.sh` 与 patch 保持 LF 换行；直接调用官方模块会把脚本写成 CRLF。Linux/macOS
-也可使用该入口，它会原样委托给官方 harness。
-
-先确认单实例从生成到评分全链路通过，再逐步扩大 `--limit`。正式 test split 有
-300 个实例，会产生较多模型调用、克隆数据和 Docker 镜像。
+通用 `python -m myagent.swebench` 和 `python -m myagent.swebench_eval` 入口仍可
+手动用于 Lite 等 JSON/JSONL 数据集。通用生成入口同样要求 `--environments`
+提供经过检查的 Docker 环境；它不包含 Mini 的整批费用预算保护。补丁捕获
+包含已跟踪变更及未被 Git 忽略的新文件，不修改原有暂存区。
+Windows 使用 `myagent.swebench_eval` 可保持容器脚本的 LF 换行。
 
 ## 模块清单
 

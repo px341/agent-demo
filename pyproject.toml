@@ -27,6 +27,10 @@ myagent-swebench-eval = "myagent.swebench_eval:main"
 [tool.setuptools.package-data]
 myagent = ["prompts/*.md"]
 
+[tool.pytest.ini_options]
+testpaths = ["test"]
+norecursedirs = [".swebench-work", "logs", "agentvenv", ".venv"]
+
 [tool.setuptools.packages.find]
 include = ["myagent*"]
 exclude = ["test*", "memories*"]
